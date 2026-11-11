@@ -69,6 +69,15 @@ class KundalikClient:
             log.warning("debug dump xato: %s", e)
 
     @staticmethod
+    async def _log_links(page: Page) -> None:
+        """Sahifadagi havolalarni logga yozadi (sozlash uchun)."""
+        links = await page.evaluate(
+            "() => [...document.querySelectorAll('a')].map(a => (a.innerText||'').trim().replace(/\\s+/g,' ') + ' | ' + a.href)"
+            ".filter(x => !x.startsWith(' |'))"
+        )
+        log.info("Sahifa %s havolalari:\n%s", page.url, "\n".join(links[:150]))
+
+    @staticmethod
     async def _click_text(page: Page, pattern: re.Pattern, kinds=("a", "button", "input[type=submit]", "span")) -> bool:
         for kind in kinds:
             loc = page.locator(kind).filter(has_text=pattern) if not kind.startswith("input") else page.locator(kind)
@@ -152,19 +161,24 @@ class KundalikClient:
             await self._dump(page, "report_custom")
             return
 
-        if "schools." not in page.url:
-            await page.goto(SCHOOLS_URL + "/", wait_until="networkidle")
-        await self._dump(page, "schools_home")
-
-        if not await self._click_text(page, RE_REPORTS, kinds=("a",)):
-            raise KundalikError("Saytda 'Hisobotlar' bo'limi topilmadi. (debug papkasini tekshiring)")
-        await page.wait_for_load_state("networkidle")
+        # Kirgandan keyingi sahifadan maktab ID sini olamiz
+        html = await page.content()
+        m = re.search(r"school=(\d{6,})", html) or re.search(r"/journal/school/(\d{6,})", html)
+        school = m.group(1) if m else None
+        url = f"{SCHOOLS_URL}/v2/reports/default" + (f"?school={school}" if school else "")
+        await page.goto(url, wait_until="networkidle")
         await self._dump(page, "reports")
+        await self._log_links(page)
 
         if not await self._click_text(page, RE_FINAL, kinds=("a",)):
             raise KundalikError("'Yakuniy / choraklik baholar' hisoboti topilmadi.")
         await page.wait_for_load_state("networkidle")
         await self._dump(page, "final_marks")
+        await self._log_links(page)
+        sels = await page.evaluate(
+            "() => [...document.querySelectorAll('select')].map(s => (s.name||s.id) + ': ' + [...s.options].map(o => o.text.trim()).join(' / '))"
+        )
+        log.info("Tanlov ro'yxatlari:\n%s", "\n".join(sels))
 
     async def _extract_table(self, page: Page) -> list[list[str]]:
         """Sahifadagi eng katta jadvalni qatorlar ro'yxati ko'rinishida qaytaradi."""
