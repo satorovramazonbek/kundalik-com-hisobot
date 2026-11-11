@@ -46,6 +46,42 @@ class Report:
     excel_name: str | None = None
 
 
+@dataclass
+class ClassReport:
+    """'Sinf rahbariga' hisoboti: o'quvchilar x fanlar."""
+    class_name: str
+    period: str                       # masalan: "2 chorak" (saytning o'zi yozgani)
+    subjects: list[str]
+    students: list[tuple[str, str, list[str], str, str]]  # (№, FISH, [fan baholari], o'rtacha, reyting)
+    footer: list[tuple[str, list[str]]]                    # (nomi, [fanlar bo'yicha qiymat])
+    site_excel: bytes | None = None
+    site_excel_name: str | None = None
+
+
+def quarter_date(quarter: int) -> str:
+    """Chorak ichidagi sana (dd/mm/yyyy). Kelajakdagi sana bo'lsa — bugun."""
+    import datetime as dt
+    mmdd = os.getenv("QUARTER_DATES", "10-15,12-15,02-20,04-25").split(",")[quarter - 1]
+    m, d = map(int, mmdd.split("-"))
+    y = int(STUDY_YEAR) if m >= 8 else int(STUDY_YEAR) + 1
+    day = min(dt.date(y, m, d), dt.date.today())
+    return day.strftime("%d/%m/%Y")
+
+
+def available_quarters() -> list[int]:
+    """Boshlangan choraklar (kelajakdagilarni ko'rsatmaymiz)."""
+    import datetime as dt
+    starts = os.getenv("QUARTER_STARTS", "09-02,11-04,01-08,03-28").split(",")
+    today = dt.date.today()
+    out = []
+    for q, mmdd in enumerate(starts, 1):
+        m, d = map(int, mmdd.split("-"))
+        y = int(STUDY_YEAR) if m >= 8 else int(STUDY_YEAR) + 1
+        if dt.date(y, m, d) <= today:
+            out.append(q)
+    return out or [1]
+
+
 class KundalikClient:
     def __init__(self, login: str, password: str):
         self.login_name = login
@@ -186,91 +222,68 @@ class KundalikClient:
             raise KundalikError("Hisobot sahifasida sinflar ro'yxati topilmadi.")
         return out
 
-    async def list_periods(self, group_id: str) -> list[tuple[str, str]]:
-        """Sinf tanlangandan keyingi davrlar (choraklar): [(nomi, qiymat), ...]"""
+    async def build_class_report(self, class_name: str, group_id: str, quarter: int) -> ClassReport:
         page = self.page
         await page.goto(await self._report_url(f"&group={group_id}"), wait_until="networkidle")
-        await self._dump(page, "report_group")
-        data = await page.evaluate(
-            """() => {
-                const links = [...document.querySelectorAll('a[href*="period="]')]
-                    .filter(a => a.href.includes('report='))
-                    .map(a => [(a.title || a.innerText).trim(), 'link:' + a.href]);
-                const sels = [];
-                document.querySelectorAll('select').forEach(s => {
-                    [...s.options].forEach(o => sels.push([o.text.trim(), 'select:' + (s.id || s.name) + '=' + o.value]));
-                });
-                const radios = [...document.querySelectorAll('input[type=radio]')].map(r => {
-                    const l = r.labels && r.labels[0] ? r.labels[0].innerText.trim() : r.value;
-                    return [l, 'radio:' + (r.id ? '#' + r.id : '[value="' + r.value + '"]')];
-                });
-                return links.concat(sels, radios);
-            }"""
-        )
-        log.info("Davr tanlovlari: %s", data)
-        out = [(n, v) for n, v in data if n and RE_PERIOD.search(n)]
-        return out or [(n, v) for n, v in data if n]
-
-    async def build_report(self, class_name: str, period_name: str, period_value: str | None) -> Report:
-        page = self.page
-        if period_value:
-            kind, _, val = period_value.partition(":")
-            if kind == "link":
-                await page.goto(val, wait_until="networkidle")
-            elif kind == "select":
-                sel, _, opt = val.partition("=")
-                await page.select_option(f"#{sel}, [name='{sel}']", value=opt)
-                await page.wait_for_load_state("networkidle")
-            elif kind == "radio":
-                await page.check(val)
+        date = quarter_date(quarter)
+        await page.evaluate("d => { const el = document.querySelector('#date'); if (el) { el.value = d;"
+                            " el.dispatchEvent(new Event('change', {bubbles: true})); } }", date)
         await self._dump(page, "report_params")
 
         btn = page.locator("#build_report_button")
         await btn.wait_for(state="visible")
-        try:
-            await page.wait_for_function("() => !document.querySelector('#build_report_button').disabled", timeout=15000)
-        except PWTimeout:
-            raise KundalikError("'Hisobot qurish' tugmasi faollashmadi (parametrlar to'liq tanlanmagan).")
         await btn.click()
-
-        # Hisobot tayyor bo'lishini kutamiz
         try:
-            await page.wait_for_function(
-                """() => {
-                    const ph = document.querySelector('#reportPlaceHolder');
-                    const ex = document.querySelector('#excelButton');
-                    return (ph && ph.style.display !== 'none' && ph.innerText.trim().length > 0)
-                        || (ex && ex.style.display !== 'none');
-                }""",
-                timeout=180000,
-            )
+            await page.wait_for_selector("#reportPlaceHolder table#marks", timeout=180000)
         except PWTimeout:
-            raise KundalikError("Hisobot tuzilishi juda uzoq davom etdi.")
-        await page.wait_for_timeout(1500)
+            msg = await page.evaluate("() => (document.querySelector('#errors')?.innerText || '').trim()")
+            raise KundalikError("Hisobot tuzilmadi." + (f"\nSayt javobi: {msg}" if msg else ""))
+        await page.wait_for_timeout(1000)
         await self._dump(page, "report_result")
 
-        title = f"{class_name} — {period_name}"
+        rep = await self._parse_marks(page, class_name, quarter)
 
-        # 1) Saytning o'z Excel fayli
-        href = await page.evaluate("() => { const a = document.querySelector('#excelButton'); return a && a.style.display !== 'none' ? a.href : null; }")
+        # Saytning umumiy Excel fayli (ixtiyoriy)
+        href = await page.evaluate("() => { const a = document.querySelector('#excelButton');"
+                                   " return a && a.style.display !== 'none' ? a.href : null; }")
         if href and not href.endswith("#"):
             try:
                 resp = await page.context.request.get(href, timeout=120000)
-                ctype = resp.headers.get("content-type", "")
                 body = await resp.body()
-                if resp.ok and ("excel" in ctype or "spreadsheet" in ctype or "octet" in ctype or body[:2] == b"PK"):
-                    cd = resp.headers.get("content-disposition", "")
-                    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
-                    return Report(title=title, excel_bytes=body, excel_name=m.group(1) if m else "hisobot.xlsx")
-                log.info("Excel havola Excel qaytarmadi: %s %s", resp.status, ctype)
+                if resp.ok and body[:2] == b"PK":
+                    rep.site_excel = body
+                    rep.site_excel_name = "umumiy.xlsx"
             except Exception as e:
-                log.warning("Excel yuklab olishda xato: %s", e)
+                log.warning("Sayt Excel faylini olishda xato: %s", e)
+        return rep
 
-        # 2) Jadvalni o'zimiz o'qiymiz
-        rows = await self._extract_table(page)
-        if len(rows) < 2:
-            raise KundalikError("Hisobot jadvali bo'sh yoki topilmadi.")
-        return Report(title=title, rows=rows)
+    async def _parse_marks(self, page: Page, class_name: str, quarter: int) -> ClassReport:
+        data = await page.evaluate(
+            """() => {
+                const clean = el => el.innerText.replace(/\\s+/g, ' ').trim();
+                const ph = document.querySelector('#reportPlaceHolder');
+                const t = ph.querySelector('table#marks');
+                const head = [...t.querySelectorAll('thead tr:first-child > *')].map(clean);
+                const body = [...t.querySelectorAll('tbody tr')].map(tr => [...tr.children].map(clean));
+                const foot = [...t.querySelectorAll('tfoot tr')].map(tr => [...tr.children].map(clean));
+                const title = (ph.querySelector('div')?.innerText || '').trim();
+                return {head, body, foot, title};
+            }"""
+        )
+        head = data["head"]
+        # head: №, FISH, fan1..fanN, O'rtacha ball, Reyting
+        subjects = head[2:-2]
+        n = len(subjects)
+        students = [(r[0], r[1], r[2:2 + n], r[2 + n] if len(r) > 2 + n else "", r[3 + n] if len(r) > 3 + n else "")
+                    for r in data["body"] if len(r) >= 2 + n]
+        footer = [(r[0], r[1:1 + n]) for r in data["foot"] if r]
+        m = re.search(r":\s*(.+)$", data["title"])
+        period = m.group(1).strip() if m else f"{quarter} chorak"
+        log.info("Hisobot: %s, %s, fanlar=%s, o'quvchilar=%d", class_name, period, subjects, len(students))
+        if not subjects:
+            raise KundalikError("Hisobotda fanlar topilmadi.")
+
+        return ClassReport(class_name, period, subjects, students, footer)
 
     async def _extract_table(self, page: Page) -> list[list[str]]:
         """Sahifadagi eng katta jadvalni qatorlar ro'yxati ko'rinishida qaytaradi."""
@@ -320,7 +333,7 @@ class KundalikClient:
 async def _cli() -> None:
     """Terminaldan sinash: python scraper.py LOGIN PAROL"""
     import sys
-    from excel import build_excel
+    from excel import build_subject_excel
 
     c = KundalikClient(sys.argv[1], sys.argv[2])
     await c.open()
@@ -333,11 +346,11 @@ async def _cli() -> None:
         for i, (n, _) in enumerate(classes):
             print(i, n)
         cname, gid = classes[int(input("Sinf raqami: "))]
-        periods = await c.list_periods(gid)
-        for i, (n, _) in enumerate(periods):
-            print(i, n)
-        pname, pval = periods[int(input("Davr raqami: "))] if periods else ("", None)
-        name, data = build_excel(await c.build_report(cname, pname, pval))
+        q = int(input(f"Chorak {available_quarters()}: "))
+        rep = await c.build_class_report(cname, gid, q)
+        for i, sub in enumerate(rep.subjects):
+            print(i, sub)
+        name, data = build_subject_excel(rep, int(input("Fan raqami: ")))
         Path(name).write_bytes(data)
         print("Saqlandi:", name)
     finally:

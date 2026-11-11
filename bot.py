@@ -2,13 +2,14 @@
 Telegram bot: o'qituvchi login/paroli bilan kundalik.com (emaktab.uz) ga kiradi,
 sinflar va choraklarni tugma qilib ko'rsatadi, tanlangan hisobotni Excel qilib yuboradi.
 
-Oqim: /start -> login -> parol -> (captcha) -> sinf tugmasi -> chorak tugmasi -> Excel
+Oqim: /start -> login -> parol -> (captcha) -> sinf -> chorak -> fan -> Excel
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -21,8 +22,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from excel import build_excel  # noqa: E402
-from scraper import KundalikClient, KundalikError  # noqa: E402
+from excel import build_class_excel, build_subject_excel  # noqa: E402
+from scraper import KundalikClient, KundalikError, available_quarters  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -248,59 +249,89 @@ async def chose_class(cb: CallbackQuery, state: FSMContext, bot: Bot):
     sess = SESSIONS.get(uid)
     if not sess or "classes" not in sess:
         return await cb.answer("Seans tugagan. /start", show_alert=True)
-    if sess["busy"]:
-        return await cb.answer("Iltimos kuting...")
     await cb.answer()
     touch(uid, bot, cb.message.chat.id, state)
-    name, gid = sess["classes"][int(cb.data.split(":")[1])]
-    sess["class"] = name
-    await cb.message.edit_text(f"Sinf: <b>{name}</b>\n⏳ Choraklar olinmoqda...")
-    sess["busy"] = True
-    try:
-        periods = await sess["client"].list_periods(gid)
-    except KundalikError as e:
-        return await fail(cb.message, state, uid, str(e))
-    except Exception:
-        log.exception("Davrlar olinmadi")
-        return await fail(cb.message, state, uid, "Choraklarni olishda xatolik.")
-    finally:
-        sess["busy"] = False
-
-    if not periods:  # davr tanlovi yo'q — sayt standart davr bilan quradi
-        periods = [("Joriy davr", None)]
-    sess["periods"] = periods
-    await cb.message.edit_text(f"Sinf: <b>{name}</b>\n\n4️⃣ <b>Chorakni</b> tanlang:",
-                               reply_markup=kb([p[0] for p in periods], "per", cols=2))
+    sess["class"] = sess["classes"][int(cb.data.split(":")[1])]
+    quarters = available_quarters()
+    buttons = [[InlineKeyboardButton(text=f"{q}-chorak", callback_data=f"q:{q}") for q in quarters]]
+    await cb.message.edit_text(f"Sinf: <b>{sess['class'][0]}</b>\n\n4️⃣ <b>Chorakni</b> tanlang:",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
-@router.callback_query(F.data.startswith("per:"))
-async def chose_period(cb: CallbackQuery, state: FSMContext):
+def subjects_kb(subjects: list[str]) -> InlineKeyboardMarkup:
+    m = kb(subjects, "sub", cols=2)
+    m.inline_keyboard.append([InlineKeyboardButton(text="📊 Umumiy (barcha fanlar)", callback_data="sub:all")])
+    m.inline_keyboard.append([InlineKeyboardButton(text="✅ Tugatish", callback_data="sub:done")])
+    return m
+
+
+@router.callback_query(F.data.startswith("q:"))
+async def chose_quarter(cb: CallbackQuery, state: FSMContext, bot: Bot):
     uid = cb.from_user.id
     sess = SESSIONS.get(uid)
-    if not sess or "periods" not in sess:
+    if not sess or "class" not in sess:
         return await cb.answer("Seans tugagan. /start", show_alert=True)
     if sess["busy"]:
         return await cb.answer("Iltimos kuting...")
     await cb.answer()
+    touch(uid, bot, cb.message.chat.id, state)
+    quarter = int(cb.data.split(":")[1])
+    cname, gid = sess["class"]
+    await cb.message.edit_text(f"Sinf: <b>{cname}</b>, {quarter}-chorak\n⏳ Hisobot tuzilmoqda... (1-3 daqiqa)")
     sess["busy"] = True
-    pname, pval = sess["periods"][int(cb.data.split(":")[1])]
-    await cb.message.edit_text(f"Sinf: <b>{sess['class']}</b>, {pname}\n⏳ Hisobot tuzilmoqda... (1-3 daqiqa)")
     try:
-        report = await asyncio.wait_for(sess["client"].build_report(sess["class"], pname, pval), 300)
-        filename, content = build_excel(report)
-        await cb.message.answer_document(BufferedInputFile(content, filename=filename),
-                                         caption=f"✅ {report.title}\n\nYana hisobot: /start")
-        await cb.message.delete()
+        rep = await asyncio.wait_for(sess["client"].build_class_report(cname, gid, quarter), 300)
     except KundalikError as e:
-        await cb.message.answer(f"⚠️ {e}\n\nQayta urinish: /start")
+        return await fail(cb.message, state, uid, str(e))
     except asyncio.TimeoutError:
-        await cb.message.answer("⌛ Sayt juda sekin javob berdi. Keyinroq urinib ko'ring: /start")
+        return await fail(cb.message, state, uid, "Sayt juda sekin javob berdi. Keyinroq urinib ko'ring.")
     except Exception:
         log.exception("Hisobot xato")
-        await cb.message.answer("❗ Kutilmagan xatolik yuz berdi. /start")
+        return await fail(cb.message, state, uid, "Kutilmagan xatolik yuz berdi.")
     finally:
+        sess["busy"] = False
+
+    sess["report"] = rep
+    note = ""
+    if not re.search(rf"\b{quarter}\b", rep.period):
+        note = f"\n⚠️ Sayt <b>{rep.period}</b> uchun hisobot berdi (chorak sanalarini .env da tekshiring)."
+    await cb.message.edit_text(
+        f"Sinf: <b>{cname}</b>, hisobot davri: <b>{rep.period}</b>{note}\n\n"
+        f"5️⃣ <b>Fanni</b> tanlang (bir nechtasini ketma-ket olishingiz mumkin):",
+        reply_markup=subjects_kb(rep.subjects),
+    )
+
+
+@router.callback_query(F.data.startswith("sub:"))
+async def chose_subject(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    uid = cb.from_user.id
+    sess = SESSIONS.get(uid)
+    if not sess or "report" not in sess:
+        return await cb.answer("Seans tugagan. /start", show_alert=True)
+    what = cb.data.split(":")[1]
+    if what == "done":
+        await cb.answer()
         await state.clear()
         await drop_session(uid)
+        await cb.message.edit_reply_markup(reply_markup=None)
+        return await cb.message.answer("✅ Tayyor. Yangi hisobot: /start")
+
+    touch(uid, bot, cb.message.chat.id, state)
+    rep = sess["report"]
+    try:
+        if what == "all":
+            filename, content = build_class_excel(rep)
+            caption = f"📊 {rep.class_name} — umumiy, {rep.period}"
+        else:
+            idx = int(what)
+            filename, content = build_subject_excel(rep, idx)
+            caption = f"📘 {rep.class_name} — {rep.subjects[idx]}, {rep.period}"
+        await cb.answer("Yuborilmoqda...")
+        await cb.message.answer_document(BufferedInputFile(content, filename=filename),
+                                         caption=caption + "\n\nYana fan tanlang yoki «✅ Tugatish» ni bosing.")
+    except Exception:
+        log.exception("Excel xato")
+        await cb.answer("Xatolik yuz berdi", show_alert=True)
 
 
 @router.message()
