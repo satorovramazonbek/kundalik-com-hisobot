@@ -27,10 +27,11 @@ DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "debug"))
 SAVE_DEBUG = os.getenv("SAVE_DEBUG", "1") != "0"
 
 # Menyu/tugma matnlari (o'zbek lotin, kirill va rus tilidagi variantlar)
-RE_REPORTS = re.compile(r"hisobot|ҳисобот|отч[её]т", re.I)
-RE_FINAL = re.compile(r"yakuniy|якуний|итогов|chorak|чорак|четверт", re.I)
-RE_SHOW = re.compile(r"ko.?rsat|кўрсат|показат|сформир|shakllant|qidir|найти", re.I)
-RE_EXCEL = re.compile(r"excel|xls|эксел", re.I)
+RE_PERIOD = re.compile(r"chorak|чорак|четверт|yarim|полугод|semestr|триместр|yil|год", re.I)
+# Hisobot turi: "O'zlashtirish -> Sinf rahbariga". Boshqasi kerak bo'lsa .env da o'zgartiring
+# (masalan: digital-tabel, progress-groups, progress-students)
+REPORT_KEY = os.getenv("REPORT_KEY", "progress-classteacher")
+STUDY_YEAR = os.getenv("STUDY_YEAR", time.strftime("%Y") if int(time.strftime("%m")) >= 9 else str(int(time.strftime("%Y")) - 1))
 
 
 class KundalikError(Exception):
@@ -51,6 +52,7 @@ class KundalikClient:
         self.password = password
         self.logged_in = False
         self.page: Page | None = None
+        self.school_id: str | None = None
         self._dbg_dir = DEBUG_DIR / time.strftime("%Y%m%d-%H%M%S")
         self._step = 0
 
@@ -153,32 +155,122 @@ class KundalikClient:
         self.logged_in = True
         return None
 
-    async def _open_final_marks_report(self, page: Page) -> None:
-        """'Hisobotlar' -> 'Yakuniy baholar' sahifasini topib ochadi."""
-        custom = os.getenv("KUNDALIK_REPORT_URL")  # kerak bo'lsa .env da aniq URL berish mumkin
-        if custom:
-            await page.goto(custom, wait_until="networkidle")
-            await self._dump(page, "report_custom")
-            return
+    # ---------------- hisobot ----------------
+    async def _report_url(self, extra: str = "") -> str:
+        if not self.school_id:
+            html = await self.page.content()
+            m = re.search(r"school=(\d{6,})", html) or re.search(r"/journal/school/(\d{6,})", html)
+            if not m:
+                raise KundalikError("Maktab ID si topilmadi.")
+            self.school_id = m.group(1)
+        return (f"{SCHOOLS_URL}/v2/reports/default?school={self.school_id}"
+                f"&report={REPORT_KEY}&year={STUDY_YEAR}{extra}")
 
-        # Kirgandan keyingi sahifadan maktab ID sini olamiz
-        html = await page.content()
-        m = re.search(r"school=(\d{6,})", html) or re.search(r"/journal/school/(\d{6,})", html)
-        school = m.group(1) if m else None
-        url = f"{SCHOOLS_URL}/v2/reports/default" + (f"?school={school}" if school else "")
-        await page.goto(url, wait_until="networkidle")
-        await self._dump(page, "reports")
-        await self._log_links(page)
-
-        if not await self._click_text(page, RE_FINAL, kinds=("a",)):
-            raise KundalikError("'Yakuniy / choraklik baholar' hisoboti topilmadi.")
-        await page.wait_for_load_state("networkidle")
-        await self._dump(page, "final_marks")
-        await self._log_links(page)
-        sels = await page.evaluate(
-            "() => [...document.querySelectorAll('select')].map(s => (s.name||s.id) + ': ' + [...s.options].map(o => o.text.trim()).join(' / '))"
+    async def list_classes(self) -> list[tuple[str, str]]:
+        """Hisobot sahifasidagi sinflar ro'yxati: [(nomi, group_id), ...]"""
+        page = self.page
+        await page.goto(await self._report_url(), wait_until="networkidle")
+        await self._dump(page, "report_classes")
+        items = await page.evaluate(
+            """() => [...document.querySelectorAll('a[href*="group="]')]
+                .filter(a => a.href.includes('report='))
+                .map(a => [(a.title || a.innerText).trim(), new URL(a.href).searchParams.get('group')])"""
         )
-        log.info("Tanlov ro'yxatlari:\n%s", "\n".join(sels))
+        seen, out = set(), []
+        for name, gid in items:
+            if gid and gid not in seen and name:
+                seen.add(gid)
+                out.append((name, gid))
+        log.info("Sinflar: %s", out)
+        if not out:
+            raise KundalikError("Hisobot sahifasida sinflar ro'yxati topilmadi.")
+        return out
+
+    async def list_periods(self, group_id: str) -> list[tuple[str, str]]:
+        """Sinf tanlangandan keyingi davrlar (choraklar): [(nomi, qiymat), ...]"""
+        page = self.page
+        await page.goto(await self._report_url(f"&group={group_id}"), wait_until="networkidle")
+        await self._dump(page, "report_group")
+        data = await page.evaluate(
+            """() => {
+                const links = [...document.querySelectorAll('a[href*="period="]')]
+                    .filter(a => a.href.includes('report='))
+                    .map(a => [(a.title || a.innerText).trim(), 'link:' + a.href]);
+                const sels = [];
+                document.querySelectorAll('select').forEach(s => {
+                    [...s.options].forEach(o => sels.push([o.text.trim(), 'select:' + (s.id || s.name) + '=' + o.value]));
+                });
+                const radios = [...document.querySelectorAll('input[type=radio]')].map(r => {
+                    const l = r.labels && r.labels[0] ? r.labels[0].innerText.trim() : r.value;
+                    return [l, 'radio:' + (r.id ? '#' + r.id : '[value="' + r.value + '"]')];
+                });
+                return links.concat(sels, radios);
+            }"""
+        )
+        log.info("Davr tanlovlari: %s", data)
+        out = [(n, v) for n, v in data if n and RE_PERIOD.search(n)]
+        return out or [(n, v) for n, v in data if n]
+
+    async def build_report(self, class_name: str, period_name: str, period_value: str | None) -> Report:
+        page = self.page
+        if period_value:
+            kind, _, val = period_value.partition(":")
+            if kind == "link":
+                await page.goto(val, wait_until="networkidle")
+            elif kind == "select":
+                sel, _, opt = val.partition("=")
+                await page.select_option(f"#{sel}, [name='{sel}']", value=opt)
+                await page.wait_for_load_state("networkidle")
+            elif kind == "radio":
+                await page.check(val)
+        await self._dump(page, "report_params")
+
+        btn = page.locator("#build_report_button")
+        await btn.wait_for(state="visible")
+        try:
+            await page.wait_for_function("() => !document.querySelector('#build_report_button').disabled", timeout=15000)
+        except PWTimeout:
+            raise KundalikError("'Hisobot qurish' tugmasi faollashmadi (parametrlar to'liq tanlanmagan).")
+        await btn.click()
+
+        # Hisobot tayyor bo'lishini kutamiz
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const ph = document.querySelector('#reportPlaceHolder');
+                    const ex = document.querySelector('#excelButton');
+                    return (ph && ph.style.display !== 'none' && ph.innerText.trim().length > 0)
+                        || (ex && ex.style.display !== 'none');
+                }""",
+                timeout=180000,
+            )
+        except PWTimeout:
+            raise KundalikError("Hisobot tuzilishi juda uzoq davom etdi.")
+        await page.wait_for_timeout(1500)
+        await self._dump(page, "report_result")
+
+        title = f"{class_name} — {period_name}"
+
+        # 1) Saytning o'z Excel fayli
+        href = await page.evaluate("() => { const a = document.querySelector('#excelButton'); return a && a.style.display !== 'none' ? a.href : null; }")
+        if href and not href.endswith("#"):
+            try:
+                resp = await page.context.request.get(href, timeout=120000)
+                ctype = resp.headers.get("content-type", "")
+                body = await resp.body()
+                if resp.ok and ("excel" in ctype or "spreadsheet" in ctype or "octet" in ctype or body[:2] == b"PK"):
+                    cd = resp.headers.get("content-disposition", "")
+                    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
+                    return Report(title=title, excel_bytes=body, excel_name=m.group(1) if m else "hisobot.xlsx")
+                log.info("Excel havola Excel qaytarmadi: %s %s", resp.status, ctype)
+            except Exception as e:
+                log.warning("Excel yuklab olishda xato: %s", e)
+
+        # 2) Jadvalni o'zimiz o'qiymiz
+        rows = await self._extract_table(page)
+        if len(rows) < 2:
+            raise KundalikError("Hisobot jadvali bo'sh yoki topilmadi.")
+        return Report(title=title, rows=rows)
 
     async def _extract_table(self, page: Page) -> list[list[str]]:
         """Sahifadagi eng katta jadvalni qatorlar ro'yxati ko'rinishida qaytaradi."""
@@ -224,61 +316,28 @@ class KundalikClient:
             await self._pw.stop()
             self._pw = None
 
-    async def get_quarter_report(self, class_name: str, quarter: int) -> Report:
-        if not self.logged_in:
-            raise KundalikError("Avval tizimga kirish kerak.")
-        page = self.page
-        await self._open_final_marks_report(page)
-
-        if not await self._select_option(page, class_name):
-            raise KundalikError(f"'{class_name}' sinfi ro'yxatda topilmadi. Sinf nomini saytdagidek yozing (masalan: 5-A).")
-        for qn in (f"{quarter}-chorak", f"{quarter} chorak", f"{quarter}-четверть", f"{quarter} четверть", f"{quarter}-чорак"):
-            if await self._select_option(page, qn):
-                break
-        else:
-            raise KundalikError(f"{quarter}-chorak tanlovi topilmadi.")
-        await self._dump(page, "selected")
-
-        await self._click_text(page, RE_SHOW)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=30000)
-        except PWTimeout:
-            pass
-        await self._dump(page, "result")
-
-        title = f"{class_name} sinf — {quarter}-chorak"
-        excel_btn = page.locator("a, button").filter(has_text=RE_EXCEL)
-        if await excel_btn.count():
-            try:
-                async with page.expect_download(timeout=30000) as dl_info:
-                    await excel_btn.first.click()
-                dl = await dl_info.value
-                path = await dl.path()
-                if path:
-                    return Report(title=title, excel_bytes=Path(path).read_bytes(), excel_name=dl.suggested_filename)
-            except PWTimeout:
-                log.info("Excel tugmasi yuklab bermadi, jadvalni o'zimiz o'qiymiz")
-
-        rows = await self._extract_table(page)
-        if len(rows) < 2:
-            raise KundalikError("Hisobot jadvali bo'sh yoki topilmadi.")
-        return Report(title=title, rows=rows)
-
 
 async def _cli() -> None:
-    """Terminaldan sinash: python scraper.py LOGIN PAROL 5-A 2"""
+    """Terminaldan sinash: python scraper.py LOGIN PAROL"""
     import sys
     from excel import build_excel
 
-    login, pwd, cls, q = sys.argv[1:5]
-    c = KundalikClient(login, pwd)
+    c = KundalikClient(sys.argv[1], sys.argv[2])
     await c.open()
     try:
         img = await c.login()
         while img:
             Path("captcha.png").write_bytes(img)
             img = await c.login(input("captcha.png dagi belgilarni kiriting: "))
-        name, data = build_excel(await c.get_quarter_report(cls, int(q)))
+        classes = await c.list_classes()
+        for i, (n, _) in enumerate(classes):
+            print(i, n)
+        cname, gid = classes[int(input("Sinf raqami: "))]
+        periods = await c.list_periods(gid)
+        for i, (n, _) in enumerate(periods):
+            print(i, n)
+        pname, pval = periods[int(input("Davr raqami: "))] if periods else ("", None)
+        name, data = build_excel(await c.build_report(cname, pname, pval))
         Path(name).write_bytes(data)
         print("Saqlandi:", name)
     finally:
