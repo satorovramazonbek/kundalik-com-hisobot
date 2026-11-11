@@ -47,8 +47,10 @@ class Report:
 
 class KundalikClient:
     def __init__(self, login: str, password: str):
-        self.login = login
+        self.login_name = login
         self.password = password
+        self.logged_in = False
+        self.page: Page | None = None
         self._dbg_dir = DEBUG_DIR / time.strftime("%Y%m%d-%H%M%S")
         self._step = 0
 
@@ -101,19 +103,31 @@ class KundalikClient:
         return False
 
     # ---------------- asosiy qadamlar ----------------
-    async def _do_login(self, page: Page) -> None:
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        await self._dump(page, "login_page")
+    async def _captcha_visible(self, page: Page) -> bool:
+        img = page.locator("img.captcha__image")
+        return bool(await img.count()) and await img.first.is_visible()
 
-        captcha = page.locator("input[name='Captcha.Input']")
-        if await captcha.count() and await captcha.first.is_visible():
-            raise KundalikError(
-                "Saytda captcha chiqyapti (ko'p marta noto'g'ri urinish bo'lgan). "
-                "Bir oz kuting yoki brauzerda bir marta qo'lda kiring, so'ng qayta urinib ko'ring."
-            )
+    async def _captcha_png(self, page: Page) -> bytes:
+        img = page.locator("img.captcha__image").first
+        await img.wait_for(state="visible")
+        await page.wait_for_function("el => el.complete && el.naturalWidth > 0", arg=await img.element_handle())
+        return await img.screenshot()
 
-        await page.fill("input[name='login']", self.login)
+    async def login(self, captcha: str | None = None) -> bytes | None:
+        """Kirishga urinadi. Muvaffaqiyatli bo'lsa None, captcha kerak bo'lsa uning PNG rasmini qaytaradi."""
+        page = self.page
+        if captcha is None:
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            await self._dump(page, "login_page")
+            if await self._captcha_visible(page):
+                await page.fill("input[name='login']", self.login_name)
+                await page.fill("input[name='password']", self.password)
+                return await self._captcha_png(page)
+
+        await page.fill("input[name='login']", self.login_name)
         await page.fill("input[name='password']", self.password)
+        if captcha is not None:
+            await page.fill("input[name='Captcha.Input']", captcha.strip())
         await page.click("input[type='submit'], [data-test-id='login-button']")
         try:
             await page.wait_for_load_state("networkidle", timeout=30000)
@@ -122,9 +136,13 @@ class KundalikClient:
         await self._dump(page, "after_login")
 
         if "login." in page.url and await page.locator("input[name='password']").count():
-            err = page.locator(".login__body__error, .error, .validation-summary-errors")
+            if await self._captcha_visible(page):
+                return await self._captcha_png(page)
+            err = page.locator(".login__body__hint_error-message:not(.login__body__hint_hidden)")
             msg = (await err.first.inner_text()).strip() if await err.count() else ""
             raise KundalikError("Login yoki parol noto'g'ri." + (f"\nSayt javobi: {msg}" if msg else ""))
+        self.logged_in = True
+        return None
 
     async def _open_final_marks_report(self, page: Page) -> None:
         """'Hisobotlar' -> 'Yakuniy baholar' sahifasini topib ochadi."""
@@ -173,57 +191,64 @@ class KundalikClient:
             }"""
         )
 
-    async def get_quarter_report(self, class_name: str, quarter: int) -> Report:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=HEADLESS)
-            ctx = await browser.new_context(locale="uz-UZ", accept_downloads=True, viewport={"width": 1600, "height": 1000})
-            page = await ctx.new_page()
-            page.set_default_timeout(30000)
+    async def open(self) -> None:
+        self._pw = await async_playwright().start()
+        self._browser = await self._pw.chromium.launch(headless=HEADLESS)
+        self._ctx = await self._browser.new_context(locale="uz-UZ", accept_downloads=True,
+                                                    viewport={"width": 1600, "height": 1000})
+        self.page = await self._ctx.new_page()
+        self.page.set_default_timeout(30000)
+
+    async def close(self) -> None:
+        for obj in (getattr(self, "_ctx", None), getattr(self, "_browser", None)):
             try:
-                await self._do_login(page)
-                await self._open_final_marks_report(page)
+                if obj:
+                    await obj.close()
+            except Exception:
+                pass
+        if getattr(self, "_pw", None):
+            await self._pw.stop()
+            self._pw = None
 
-                if not await self._select_option(page, class_name):
-                    raise KundalikError(f"'{class_name}' sinfi ro'yxatda topilmadi. Sinf nomini saytdagidek yozing (masalan: 5-A).")
-                quarter_names = [f"{quarter}-chorak", f"{quarter} chorak", f"{quarter}-четверть", f"{quarter} четверть", f"{quarter}-чорак"]
-                for qn in quarter_names:
-                    if await self._select_option(page, qn):
-                        break
-                else:
-                    raise KundalikError(f"{quarter}-chorak tanlovi topilmadi.")
-                await self._dump(page, "selected")
+    async def get_quarter_report(self, class_name: str, quarter: int) -> Report:
+        if not self.logged_in:
+            raise KundalikError("Avval tizimga kirish kerak.")
+        page = self.page
+        await self._open_final_marks_report(page)
 
-                await self._click_text(page, RE_SHOW)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=30000)
-                except PWTimeout:
-                    pass
-                await self._dump(page, "result")
+        if not await self._select_option(page, class_name):
+            raise KundalikError(f"'{class_name}' sinfi ro'yxatda topilmadi. Sinf nomini saytdagidek yozing (masalan: 5-A).")
+        for qn in (f"{quarter}-chorak", f"{quarter} chorak", f"{quarter}-четверть", f"{quarter} четверть", f"{quarter}-чорак"):
+            if await self._select_option(page, qn):
+                break
+        else:
+            raise KundalikError(f"{quarter}-chorak tanlovi topilmadi.")
+        await self._dump(page, "selected")
 
-                title = f"{class_name} sinf — {quarter}-chorak"
+        await self._click_text(page, RE_SHOW)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=30000)
+        except PWTimeout:
+            pass
+        await self._dump(page, "result")
 
-                # 1) Sayt o'zi Excel bera olsa — shuni yuklab olamiz
-                excel_btn = page.locator("a, button").filter(has_text=RE_EXCEL)
-                if await excel_btn.count():
-                    try:
-                        async with page.expect_download(timeout=30000) as dl_info:
-                            await excel_btn.first.click()
-                        dl = await dl_info.value
-                        path = await dl.path()
-                        if path:
-                            data = Path(path).read_bytes()
-                            return Report(title=title, excel_bytes=data, excel_name=dl.suggested_filename)
-                    except PWTimeout:
-                        log.info("Excel tugmasi yuklab bermadi, jadvalni o'zimiz o'qiymiz")
+        title = f"{class_name} sinf — {quarter}-chorak"
+        excel_btn = page.locator("a, button").filter(has_text=RE_EXCEL)
+        if await excel_btn.count():
+            try:
+                async with page.expect_download(timeout=30000) as dl_info:
+                    await excel_btn.first.click()
+                dl = await dl_info.value
+                path = await dl.path()
+                if path:
+                    return Report(title=title, excel_bytes=Path(path).read_bytes(), excel_name=dl.suggested_filename)
+            except PWTimeout:
+                log.info("Excel tugmasi yuklab bermadi, jadvalni o'zimiz o'qiymiz")
 
-                # 2) Aks holda jadvalni o'qiymiz
-                rows = await self._extract_table(page)
-                if len(rows) < 2:
-                    raise KundalikError("Hisobot jadvali bo'sh yoki topilmadi.")
-                return Report(title=title, rows=rows)
-            finally:
-                await ctx.close()
-                await browser.close()
+        rows = await self._extract_table(page)
+        if len(rows) < 2:
+            raise KundalikError("Hisobot jadvali bo'sh yoki topilmadi.")
+        return Report(title=title, rows=rows)
 
 
 async def _cli() -> None:
@@ -232,10 +257,18 @@ async def _cli() -> None:
     from excel import build_excel
 
     login, pwd, cls, q = sys.argv[1:5]
-    rep = await KundalikClient(login, pwd).get_quarter_report(cls, int(q))
-    name, data = build_excel(rep)
-    Path(name).write_bytes(data)
-    print("Saqlandi:", name)
+    c = KundalikClient(login, pwd)
+    await c.open()
+    try:
+        img = await c.login()
+        while img:
+            Path("captcha.png").write_bytes(img)
+            img = await c.login(input("captcha.png dagi belgilarni kiriting: "))
+        name, data = build_excel(await c.get_quarter_report(cls, int(q)))
+        Path(name).write_bytes(data)
+        print("Saqlandi:", name)
+    finally:
+        await c.close()
 
 
 if __name__ == "__main__":
