@@ -8,7 +8,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from scraper import ClassReport, Report
+from scraper import ClassReport, Report, TableReport
 
 THIN = Side(style="thin", color="999999")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -136,3 +136,43 @@ def build_excel(report: Report) -> tuple[str, bytes]:
     rows = [r + [""] * (width - len(r)) for r in report.rows]
     _write_table(ws, report.title, "", rows[0], rows[1:], [], mark_cols=set(range(2, width)))
     return f"{safe}.xlsx", _save(wb)
+
+
+def build_table_excel(rep: TableReport) -> tuple[str, bytes]:
+    """Umumiy jadval hisobotlari (O'zlashtirish/Davomat -> Sinflar). Har jadval alohida varaqda."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    for n, tbl in enumerate(rep.tables, 1):
+        rows = tbl["rows"]
+        width = max(len(r) for r in rows)
+        rows = [r + [""] * (width - len(r)) for r in rows]
+        head = tbl["head"] or 1
+        ws = wb.create_sheet(f"Jadval {n}" if len(rep.tables) > 1 else "Hisobot")
+        ws.cell(row=1, column=1, value=f"{rep.class_name} sinf — {rep.report_name}").font = Font(bold=True, size=14)
+        ws.cell(row=2, column=1, value=f"Hisobot davri: {rep.period}").font = Font(italic=True, color="555555")
+        r0 = 4
+        for i, row in enumerate(rows):
+            is_head = i < head
+            is_total = not is_head and re.match(r"(jami|итого|o.rtacha|всего|umumiy)", str(row[0] or row[1] if width > 1 else row[0]), re.I)
+            for c, raw in enumerate(row, 1):
+                val = _num(raw) if isinstance(raw, str) else raw
+                cell = ws.cell(row=r0 + i, column=c, value=val if val != "" else None)
+                cell.border = BORDER
+                if is_head:
+                    cell.font = Font(bold=True)
+                    cell.fill = HEAD_FILL
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                else:
+                    if is_total:
+                        cell.font = Font(bold=True)
+                        cell.fill = FOOT_FILL
+                    cell.alignment = Alignment(horizontal="left" if isinstance(val, str) and len(val) > 6 else "center",
+                                               vertical="center")
+        for c in range(1, width + 1):
+            longest = max(len(str(r[c - 1])) for r in rows[head:] or rows)
+            ws.column_dimensions[get_column_letter(c)].width = min(max(longest + 2, 6), 34)
+        for i in range(head):
+            ws.row_dimensions[r0 + i].height = 40
+        ws.freeze_panes = ws.cell(row=r0 + head, column=1)
+    kind = _safe(rep.report_name.split("—")[0]) or "hisobot"
+    return f"{_safe(rep.class_name)}_{kind}_{_safe(rep.period)}.xlsx", _save(wb)

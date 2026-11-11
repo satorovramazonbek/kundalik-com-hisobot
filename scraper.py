@@ -31,6 +31,12 @@ RE_PERIOD = re.compile(r"chorak|чорак|четверт|yarim|полугод|s
 # Hisobot turi: "O'zlashtirish -> Sinf rahbariga". Boshqasi kerak bo'lsa .env da o'zgartiring
 # (masalan: digital-tabel, progress-groups, progress-students)
 REPORT_KEY = os.getenv("REPORT_KEY", "progress-classteacher")
+# Botda tanlanadigan hisobotlar: kalit -> (sayt report=..., tugma nomi)
+REPORTS = {
+    "cr": ("progress-classteacher", "👩‍🏫 Fan bo‘yicha (Sinf rahbariga)"),
+    "pg": ("progress-groups", "📘 O‘zlashtirish — Sinflar"),
+    "ca": ("class-attendance", "🗓 Davomat — Sinflar"),
+}
 STUDY_YEAR = os.getenv("STUDY_YEAR", time.strftime("%Y") if int(time.strftime("%m")) >= 9 else str(int(time.strftime("%Y")) - 1))
 
 
@@ -44,6 +50,16 @@ class Report:
     rows: list[list[str]] = field(default_factory=list)  # 1-qator sarlavha
     excel_bytes: bytes | None = None  # sayt o'zi Excel bergan bo'lsa
     excel_name: str | None = None
+
+
+@dataclass
+class TableReport:
+    """Umumiy jadval ko'rinishidagi hisobot (Sinflar, Davomat va h.k.)."""
+    report_name: str
+    class_name: str
+    period: str
+    tables: list[dict] = field(default_factory=list)  # {"head": n, "rows": [[...]]}
+    site_excel: bytes | None = None
 
 
 @dataclass
@@ -66,6 +82,27 @@ def quarter_date(quarter: int) -> str:
     y = int(STUDY_YEAR) if m >= 8 else int(STUDY_YEAR) + 1
     day = min(dt.date(y, m, d), dt.date.today())
     return day.strftime("%d/%m/%Y")
+
+
+def quarter_range(quarter: int) -> tuple[str, str]:
+    """Chorakning boshi va oxiri (dd/mm/yyyy). Oxiri kelajakda bo'lsa — bugun."""
+    import datetime as dt
+    starts = os.getenv("QUARTER_STARTS", "09-02,11-04,01-08,03-28").split(",")
+    ends = os.getenv("QUARTER_ENDS", "").split(",") if os.getenv("QUARTER_ENDS") else None
+
+    def day(mmdd: str) -> dt.date:
+        m, d = map(int, mmdd.split("-"))
+        return dt.date(int(STUDY_YEAR) if m >= 8 else int(STUDY_YEAR) + 1, m, d)
+
+    start = day(starts[quarter - 1])
+    if ends:
+        end = day(ends[quarter - 1])
+    elif quarter < len(starts):
+        end = day(starts[quarter]) - dt.timedelta(days=1)
+    else:
+        end = day("05-25")
+    end = min(end, dt.date.today())
+    return start.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
 
 
 def available_quarters() -> list[int]:
@@ -192,7 +229,7 @@ class KundalikClient:
         return None
 
     # ---------------- hisobot ----------------
-    async def _report_url(self, extra: str = "") -> str:
+    async def _report_url(self, extra: str = "", report: str = REPORT_KEY) -> str:
         if not self.school_id:
             html = await self.page.content()
             m = re.search(r"school=(\d{6,})", html) or re.search(r"/journal/school/(\d{6,})", html)
@@ -200,17 +237,22 @@ class KundalikClient:
                 raise KundalikError("Maktab ID si topilmadi.")
             self.school_id = m.group(1)
         return (f"{SCHOOLS_URL}/v2/reports/default?school={self.school_id}"
-                f"&report={REPORT_KEY}&year={STUDY_YEAR}{extra}")
+                f"&report={report}&year={STUDY_YEAR}{extra}")
 
-    async def list_classes(self) -> list[tuple[str, str]]:
+    async def list_classes(self, report: str = REPORT_KEY) -> list[tuple[str, str]]:
         """Hisobot sahifasidagi sinflar ro'yxati: [(nomi, group_id), ...]"""
         page = self.page
-        await page.goto(await self._report_url(), wait_until="networkidle")
-        await self._dump(page, "report_classes")
+        await page.goto(await self._report_url(report=report), wait_until="networkidle")
+        await self._dump(page, f"classes_{report}")
         items = await page.evaluate(
-            """() => [...document.querySelectorAll('a[href*="group="]')]
-                .filter(a => a.href.includes('report='))
-                .map(a => [(a.title || a.innerText).trim(), new URL(a.href).searchParams.get('group')])"""
+            """() => {
+                const out = [...document.querySelectorAll('a[href*="group="]')]
+                    .filter(a => a.href.includes('report='))
+                    .map(a => [(a.title || a.innerText).trim(), new URL(a.href).searchParams.get('group')]);
+                for (const s of document.querySelectorAll('select[name*="group" i], select[id*="group" i], select[id*="class" i]'))
+                    for (const o of s.options) if (o.value && !/^0?$/.test(o.value)) out.push([o.text.trim(), o.value]);
+                return out;
+            }"""
         )
         seen, out = set(), []
         for name, gid in items:
@@ -253,6 +295,114 @@ class KundalikClient:
                 if resp.ok and body[:2] == b"PK":
                     rep.site_excel = body
                     rep.site_excel_name = "umumiy.xlsx"
+            except Exception as e:
+                log.warning("Sayt Excel faylini olishda xato: %s", e)
+        return rep
+
+    async def _set_period(self, page: Page, quarter: int) -> None:
+        """Hisobot davrini tanlaydi: chorak havolasi / ro'yxati, yoki sana (bitta yoki oraliq)."""
+        rx = rf"(^|\D){quarter}\s*[-‑]?\s*(chorak|чорак|четверт)|(chorak|четверть)\s*{quarter}(\D|$)"
+        # 1) davr havolalari (ul.switch ichidagi "1 chorak" kabi)
+        href = await page.evaluate(
+            """rx => { const r = new RegExp(rx, 'i');
+                const a = [...document.querySelectorAll('#report_wrapper a, form a')].find(a => r.test(a.innerText.trim()));
+                return a ? a.href : null; }""", rx)
+        if href and not href.endswith("#"):
+            await page.goto(href, wait_until="networkidle")
+        start, end = quarter_range(quarter)
+        done = await page.evaluate(
+            """([rx, d, d1, d2]) => {
+                const r = new RegExp(rx, 'i'), log = [];
+                const fire = el => { el.dispatchEvent(new Event('input', {bubbles: true}));
+                                     el.dispatchEvent(new Event('change', {bubbles: true})); };
+                for (const s of document.querySelectorAll('select')) {
+                    const o = [...s.options].find(o => r.test(o.text.trim()));
+                    if (o) { s.value = o.value; fire(s); log.push('select:' + (s.name || s.id) + '=' + o.text.trim()); }
+                }
+                const inputs = [...document.querySelectorAll('input[type=text], input[type=date], input:not([type])')]
+                    .filter(i => /date|from|to|start|end|begin|sana/i.test((i.id || '') + ' ' + (i.name || '')));
+                const isFrom = i => /from|start|begin|d1|_1|min/i.test((i.id || '') + ' ' + (i.name || ''));
+                const isTo = i => /(^|[^a-z])to|end|d2|_2|max|till/i.test((i.id || '') + ' ' + (i.name || ''));
+                for (const i of inputs) {
+                    const v = isFrom(i) ? d1 : isTo(i) ? d2 : d;
+                    if (i.type === 'date') { const [dd, mm, yy] = v.split('/'); i.value = `${yy}-${mm}-${dd}`; }
+                    else i.value = v;
+                    fire(i); log.push('input:' + (i.id || i.name) + '=' + i.value);
+                }
+                return log;
+            }""", [rx, quarter_date(quarter), start, end])
+        log.info("Hisobot davri (%s-chorak): havola=%s, %s", quarter, href, done)
+        await page.wait_for_timeout(500)
+
+    async def build_table_report(self, report: str, report_name: str, class_name: str, group_id: str,
+                                 quarter: int) -> TableReport:
+        """Istalgan hisobot (O'zlashtirish/Davomat -> Sinflar): sinf + chorak tanlab, jadvalni oladi."""
+        page = self.page
+        await page.goto(await self._report_url(f"&group={group_id}", report=report), wait_until="networkidle")
+        await self._set_period(page, quarter)
+        await self._dump(page, f"params_{report}")
+
+        btn = page.locator("#build_report_button, input[type=submit][value*='qurish' i], "
+                           "input[type=button][value*='qurish' i], button:has-text('qurish')").first
+        if await btn.count():
+            await btn.click()
+        try:
+            await page.wait_for_selector("#reportPlaceHolder table, #report_wrapper table.grid", timeout=180000)
+        except PWTimeout:
+            msg = await page.evaluate("() => (document.querySelector('#errors')?.innerText || "
+                                      "document.querySelector('#reportPlaceHolder')?.innerText || '').trim()")
+            await self._dump(page, f"failed_{report}")
+            raise KundalikError("Hisobot tuzilmadi." + (f"\nSayt javobi: {msg[:300]}" if msg else ""))
+        await page.wait_for_timeout(1500)
+        await self._dump(page, f"result_{report}")
+
+        data = await page.evaluate(
+            """() => {
+                const root = document.querySelector('#reportPlaceHolder') || document.querySelector('#report_wrapper');
+                const clean = el => el.innerText.replace(/\\s+/g, ' ').trim();
+                const tables = [];
+                for (const t of root.querySelectorAll('table')) {
+                    if (t.parentElement.closest('table')) continue;           // ichma-ich jadvallarni o'tkazamiz
+                    const grid = [], spans = {};                               // rowspan/colspan ni yoyish
+                    const trs = [...t.querySelectorAll(':scope > thead > tr, :scope > tbody > tr, :scope > tfoot > tr, :scope > tr')];
+                    trs.forEach((tr, ri) => {
+                        const row = []; let c = 0;
+                        const take = () => { while (spans[ri + ',' + c] !== undefined) { row[c] = spans[ri + ',' + c]; c++; } };
+                        for (const cell of tr.children) {
+                            take();
+                            const v = clean(cell), cs = +cell.getAttribute('colspan') || 1, rs = +cell.getAttribute('rowspan') || 1;
+                            for (let k = 0; k < cs; k++) {
+                                row[c + k] = k ? '' : v;
+                                for (let j = 1; j < rs; j++) spans[(ri + j) + ',' + (c + k)] = '';
+                            }
+                            c += cs;
+                        }
+                        take();
+                        grid.push([...row].map(x => x ?? ''));
+                    });
+                    const head = t.querySelectorAll(':scope > thead > tr').length;
+                    if (grid.some(r => r.some(x => x))) tables.push({head, rows: grid});
+                }
+                const title = [...root.children].filter(e => e.tagName !== 'TABLE').map(clean).find(x => x) || '';
+                return {tables, title};
+            }"""
+        )
+        if not data["tables"]:
+            raise KundalikError("Hisobotda jadval topilmadi.")
+        m = re.search(r":\s*(.+)$", data["title"])
+        period = m.group(1).strip() if m else f"{quarter} chorak"
+        log.info("Hisobot %s: %s, %s, jadvallar=%d, qatorlar=%s", report, class_name, period, len(data["tables"]),
+                 [len(x["rows"]) for x in data["tables"]])
+        rep = TableReport(report_name, class_name, period, data["tables"])
+
+        href = await page.evaluate("() => { const a = document.querySelector('#excelButton, a[href*=\"excel\" i], a[href*=\"xls\" i]');"
+                                   " return a && a.offsetParent !== null ? a.href : null; }")
+        if href and not href.endswith("#"):
+            try:
+                resp = await page.context.request.get(href, timeout=120000)
+                body = await resp.body()
+                if resp.ok and body[:2] == b"PK":
+                    rep.site_excel = body
             except Exception as e:
                 log.warning("Sayt Excel faylini olishda xato: %s", e)
         return rep
