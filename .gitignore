@@ -1,0 +1,7 @@
+.env
+.venv/
+debug/
+__pycache__/
+*.xlsx
+
+bot.log
