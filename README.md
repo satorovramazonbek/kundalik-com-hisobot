@@ -22,3 +22,13 @@ Botda `/start` → login → parol → sinf (masalan `5-A`) → chorak. `/bekor`
 - `KUNDALIK_REPORT_URL` — hisobot sahifasining aniq manzili (avtomatik topilmasa)
 
 Terminaldan sinash: `.venv/bin/python scraper.py LOGIN PAROL 5-A 2`
+
+## Buyruqlar
+- `/start` — boshlash (saqlangan seans bo'lsa, login so'ramaydi)
+- `/bekor` — joriy amalni bekor qilish
+- `/chiqish` — tizimdan chiqish va saqlangan seansni o'chirish
+- `/jurnal` — kirishlar jurnali (faqat `ADMIN_IDS` dagi adminlar uchun)
+
+## Ma'lumotlar (`data/`, gitga tushmaydi)
+- `data/jurnal.jsonl` — kim (Telegram), qachon, qaysi eMaktab profiliga kirgani va qanday hisobot olgani. Parol yozilmaydi.
+- `data/sessions/<telegram_id>.json` — saqlangan seans (cookie), `COOKIE_TTL` muddatgacha. Fayl huquqi 600.

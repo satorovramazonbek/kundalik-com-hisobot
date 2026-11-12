@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import audit  # noqa: E402
 from excel import build_class_excel, build_subject_excel, build_table_excel  # noqa: E402
 from scraper import REPORTS, SUBJECT_REPORTS, KundalikClient, KundalikError, TwoFactorRequired, available_quarters  # noqa: E402
 
@@ -34,7 +35,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
 SEM = asyncio.Semaphore(int(os.getenv("MAX_PARALLEL", "3")))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))  # ochiq brauzer necha soniya harakatsiz kutadi
-COOKIE_TTL = int(os.getenv("COOKIE_TTL", str(8 * 3600)))  # qayta login so'ramaslik muddati (faqat xotirada)
+COOKIE_TTL = int(os.getenv("COOKIE_TTL", str(7 * 24 * 3600)))  # saqlangan seans muddati (data/sessions/ da)
+ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 router = Router()
 
@@ -48,14 +50,15 @@ class Form(StatesGroup):
 
 # user_id -> {"client", "classes", "periods", "class", "timer", "tries", "busy"}
 SESSIONS: dict[int, dict] = {}
-# user_id -> (cookie holati, tugash vaqti). Faqat operativ xotirada, diskka yozilmaydi.
-COOKIES: dict[int, tuple[dict, float]] = {}
+# user_id -> {"state", "expires", "login", "profile"}. data/sessions/<id>.json da ham saqlanadi (600 huquq).
+COOKIES: dict[int, dict] = audit.load_sessions()
 
 
 # ---------------- seans boshqaruvi ----------------
 async def drop_session(uid: int, logout: bool = False) -> None:
     if logout:
         COOKIES.pop(uid, None)
+        audit.delete_session(uid)
     sess = SESSIONS.pop(uid, None)
     if not sess:
         return
@@ -63,13 +66,28 @@ async def drop_session(uid: int, logout: bool = False) -> None:
     if t and t is not asyncio.current_task():
         t.cancel()
     try:
-        if not logout and sess["client"].logged_in:
-            st = await sess["client"].storage_state()
-            if st:
-                COOKIES[uid] = (st, time.time() + COOKIE_TTL)
+        if not logout:
+            await persist(uid, sess)
         await sess["client"].close()
     finally:
         SEM.release()
+
+
+async def persist(uid: int, sess: dict | None = None) -> None:
+    """Ochiq seans cookie larini xotira va diskka saqlaydi (bot qayta ishga tushsa ham tiklanadi)."""
+    sess = sess or SESSIONS.get(uid)
+    if not sess or not sess["client"].logged_in:
+        return
+    st = await sess["client"].storage_state()
+    if not st:
+        return
+    rec = {"state": st, "expires": time.time() + COOKIE_TTL,
+           "login": sess.get("login", ""), "profile": sess.get("profile", "")}
+    COOKIES[uid] = rec
+    try:
+        audit.save_session(uid, rec["state"], rec["expires"], rec["login"], rec["profile"])
+    except OSError:
+        log.exception("Seansni diskka yozib bo'lmadi")
 
 
 def touch(uid: int, bot: Bot, chat_id: int, state: FSMContext) -> None:
@@ -137,6 +155,9 @@ def restart_status(uid: int) -> None:
 
 async def fail(msg: Message, state: FSMContext, uid: int, text: str) -> None:
     """Login xatosi: seans yopiladi."""
+    sess = SESSIONS.get(uid)
+    if sess and sess.get("user"):
+        audit.log_event(sess["user"], "login_fail", sess.get("login", ""), details=text.split("\n")[0])
     await state.clear()
     await drop_session(uid, logout=True)
     await msg.answer(f"⚠️ {text}\n\nQayta urinish: /start")
@@ -152,7 +173,7 @@ async def soft_fail(msg: Message, state: FSMContext, uid: int, text: str) -> Non
 
 
 async def open_session(uid: int, client: KundalikClient, bot: Bot, chat_id: int, state: FSMContext,
-                       storage_state: dict | None = None) -> bool:
+                       storage_state: dict | None = None, user=None, login: str = "") -> bool:
     await SEM.acquire()
     try:
         await client.open(storage_state)
@@ -160,7 +181,7 @@ async def open_session(uid: int, client: KundalikClient, bot: Bot, chat_id: int,
         SEM.release()
         log.exception("Brauzer ochilmadi")
         return False
-    SESSIONS[uid] = {"client": client, "tries": 0, "busy": False}
+    SESSIONS[uid] = {"client": client, "tries": 0, "busy": False, "user": user, "login": login}
     touch(uid, bot, chat_id, state)
     return True
 
@@ -183,14 +204,19 @@ async def start(msg: Message, state: FSMContext, bot: Bot):
     await drop_session(uid)
 
     saved = COOKIES.get(uid)
-    if saved and saved[1] > time.time():
-        wait = await msg.answer("⏳ Avvalgi seans tiklanmoqda...")
-        client = KundalikClient("", "")
-        ok = await open_session(uid, client, bot, msg.chat.id, state, saved[0])
+    if saved and saved["expires"] > time.time():
+        wait = await msg.answer("⏳ Saqlangan seans tiklanmoqda...")
+        client = KundalikClient(saved.get("login", ""), "")
+        ok = await open_session(uid, client, bot, msg.chat.id, state, saved["state"],
+                                user=msg.from_user, login=saved.get("login", ""))
         if ok and await client.resume():
-            SESSIONS[uid]["profile"] = await client.profile_name()
+            name = await client.profile_name()
+            SESSIONS[uid]["profile"] = name
+            audit.log_event(msg.from_user, "login_resume", saved.get("login", ""), name)
+            await persist(uid)
             try:
-                await wait.delete()
+                await wait.edit_text("✅ Saqlangan seans bilan profilga kirdim" +
+                                     (f": <b>{html.escape(name)}</b>" if name else "."))
             except Exception:
                 pass
             return await show_reports(msg, state, uid)
@@ -218,10 +244,26 @@ async def cancel(msg: Message, state: FSMContext):
 
 @router.message(Command("chiqish"))
 async def logout(msg: Message, state: FSMContext):
+    sess = SESSIONS.get(msg.from_user.id) or COOKIES.get(msg.from_user.id) or {}
+    audit.log_event(msg.from_user, "logout", sess.get("login", ""), sess.get("profile", ""))
     await state.clear()
     await drop_session(msg.from_user.id, logout=True)
     await msg.answer("🚪 Tizimdan chiqildi, saqlangan seans o'chirildi. Qayta kirish: /start",
                      reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("jurnal"))
+async def journal(msg: Message):
+    if msg.from_user.id not in ADMINS:
+        return await msg.answer(
+            "⛔ Jurnal faqat admin uchun.\n"
+            f"Sizning Telegram ID: <code>{msg.from_user.id}</code>\n"
+            "Admin bo'lish uchun bu ID ni .env dagi <code>ADMIN_IDS=</code> ga yozib, botni qayta ishga tushiring.")
+    text = "📒 <b>Oxirgi 20 ta hodisa</b> (yangilari tepada):\n\n" + audit.journal_text(20)
+    await msg.answer(text[:4000])
+    if audit.read_journal():
+        name, data = audit.journal_excel()
+        await msg.answer_document(BufferedInputFile(data, filename=name), caption="📒 To'liq jurnal (Excel)")
 
 
 @router.message(Form.login, F.text)
@@ -245,7 +287,9 @@ async def got_password(msg: Message, state: FSMContext, bot: Bot):
     saved = COOKIES.get(uid)  # oldingi seans cookie lari — sayt qurilmani "tanish" deb biladi, 2FA kamroq so'raladi
 
     client = KundalikClient(data["login"], password)
-    if not await open_session(uid, client, bot, msg.chat.id, state, saved[0] if saved else None):
+    audit.log_event(msg.from_user, "login_try", data["login"])
+    if not await open_session(uid, client, bot, msg.chat.id, state, saved["state"] if saved else None,
+                              user=msg.from_user, login=data["login"]):
         await state.clear()
         await msg.answer("❗ Brauzer ishga tushmadi. /start")
         return
@@ -288,6 +332,9 @@ async def logged_in(msg: Message, state: FSMContext, uid: int) -> None:
     sess = SESSIONS[uid]
     name = await sess["client"].profile_name()
     sess["profile"] = name
+    if sess.get("user"):
+        audit.log_event(sess["user"], "login_ok", sess.get("login", ""), name)
+    await persist(uid)
     await status(msg, uid, "✅ Profilga kirdim" + (f": <b>{html.escape(name)}</b>" if name else "."))
     await show_reports(msg, state, uid)
 
@@ -535,6 +582,9 @@ async def send_table_report(cb: CallbackQuery, state: FSMContext, uid: int, repo
                                          caption=caption + "\n(saytning o'z Excel fayli)")
     await cb.message.answer_document(BufferedInputFile(content, filename=filename), caption=caption,
                                      reply_markup=NEXT_KB)
+    audit.log_event(cb.from_user, "report", sess.get("login", ""), sess.get("profile", ""),
+                    f"{rname.split(' ', 1)[-1]} | {cname} | {rep.period}")
+    await persist(uid)
 
 
 @router.callback_query(F.data.startswith("sub:"))
@@ -555,6 +605,8 @@ async def chose_subject(cb: CallbackQuery, state: FSMContext, bot: Bot):
             filename, content = build_subject_excel(rep, idx)
             caption = f"📘 {rep.class_name} — {rep.subjects[idx]}, {rep.period}"
         await cb.answer("Yuborilmoqda...")
+        audit.log_event(cb.from_user, "report", sess.get("login", ""), sess.get("profile", ""),
+                        f"{caption.split(' ', 1)[-1]}")
         await cb.message.answer_document(BufferedInputFile(content, filename=filename),
                                          caption=caption + "\n\nYana fan tanlang, «🔁 Boshqa hisobot» yoki «✅ Tugatish» ni bosing.")
     except Exception:
@@ -573,7 +625,17 @@ async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
-    log.info("Bot ishga tushdi")
+
+    @dp.shutdown()
+    async def on_shutdown():
+        for uid in list(SESSIONS):
+            try:
+                await persist(uid)
+            except Exception:
+                log.exception("Seansni saqlashda xato")
+        log.info("Seanslar diskka saqlandi")
+
+    log.info("Bot ishga tushdi. Diskdan tiklangan seanslar: %d", len(COOKIES))
     await dp.start_polling(bot)
 
 
