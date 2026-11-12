@@ -527,6 +527,19 @@ class KundalikClient:
         self.page = await self._ctx.new_page()
         self.page.set_default_timeout(30000)
 
+    async def profile_name(self) -> str:
+        """Kirgan o'qituvchining F.I.Sh (sahifadagi foydalanuvchi ma'lumotidan)."""
+        js = """() => { const u = (window.__M__INITIAL__STATE__ || {}).user || {};
+                 return [u.lastName, u.firstName, u.middleName].filter(Boolean).join(' '); }"""
+        try:
+            name = await self.page.evaluate(js)
+            if not name:
+                await self.page.goto("https://emaktab.uz/teachers", wait_until="domcontentloaded")
+                name = await self.page.evaluate(js)
+            return name or ""
+        except Exception:
+            return ""
+
     async def storage_state(self) -> dict | None:
         try:
             return await self._ctx.storage_state()

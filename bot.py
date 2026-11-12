@@ -7,6 +7,7 @@ Oqim: /start -> login -> parol -> (captcha) -> hisobot turi -> sinf -> chorak ->
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -105,6 +106,35 @@ def kb(items: list[str], prefix: str, cols: int = 4) -> InlineKeyboardMarkup:
 REFRESH_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Boshqa rasm", callback_data="cap_refresh")]])
 
 
+async def status(msg: Message, uid: int, line: str, replace_last: bool = False) -> None:
+    """Bitta xabarda kirish jarayonini bosqichma-bosqich ko'rsatadi."""
+    sess = SESSIONS.get(uid)
+    if not sess:
+        return await msg.answer(line)
+    lines = sess.setdefault("status_lines", [])
+    if replace_last and lines:
+        lines[-1] = line
+    else:
+        lines.append(line)
+    text = "\n".join(lines)
+    st = sess.get("status_msg")
+    try:
+        if st:
+            await st.edit_text(text)
+            return
+    except Exception:
+        pass
+    sess["status_msg"] = await msg.answer(text)
+
+
+def restart_status(uid: int) -> None:
+    """Keyingi holat yangi xabarda chiqsin (masalan captcha rasmidan keyin)."""
+    sess = SESSIONS.get(uid)
+    if sess:
+        sess["status_msg"] = None
+        sess["status_lines"] = []
+
+
 async def fail(msg: Message, state: FSMContext, uid: int, text: str) -> None:
     """Login xatosi: seans yopiladi."""
     await state.clear()
@@ -158,6 +188,7 @@ async def start(msg: Message, state: FSMContext, bot: Bot):
         client = KundalikClient("", "")
         ok = await open_session(uid, client, bot, msg.chat.id, state, saved[0])
         if ok and await client.resume():
+            SESSIONS[uid]["profile"] = await client.profile_name()
             try:
                 await wait.delete()
             except Exception:
@@ -213,16 +244,12 @@ async def got_password(msg: Message, state: FSMContext, bot: Bot):
     await drop_session(uid)
     saved = COOKIES.get(uid)  # oldingi seans cookie lari — sayt qurilmani "tanish" deb biladi, 2FA kamroq so'raladi
 
-    wait = await msg.answer("⏳ Kundalik.com ga ulanilmoqda...")
     client = KundalikClient(data["login"], password)
     if not await open_session(uid, client, bot, msg.chat.id, state, saved[0] if saved else None):
         await state.clear()
         await msg.answer("❗ Brauzer ishga tushmadi. /start")
         return
-    try:
-        await wait.delete()
-    except Exception:
-        pass
+    await status(msg, uid, f"🔐 <b>{html.escape(data['login'])}</b> login orqali kirishga urinilmoqda...")
     await try_login(msg, state, uid, None)
 
 
@@ -243,11 +270,25 @@ async def try_login(msg: Message, state: FSMContext, uid: int, captcha: str | No
         if sess["tries"] > 6:
             return await fail(msg, state, uid, "Captcha juda ko'p marta noto'g'ri kiritildi.")
         await state.set_state(Form.captcha)
-        caption = ("❌ Captcha noto'g'ri. Yangi rasmdagi belgilarni yozing:" if captcha
-                   else "🔐 Sayt captcha so'rayapti. Rasmdagi belgilarni yozib yuboring:")
-        await msg.answer_photo(BufferedInputFile(img, "captcha.png"), caption=caption, reply_markup=REFRESH_KB)
+        if captcha:
+            await status(msg, uid, "❌ Captcha noto'g'ri, sayt yangi rasm berdi.", replace_last=True)
+        else:
+            await status(msg, uid, "🧩 Sayt captcha so'radi.")
+        await msg.answer_photo(BufferedInputFile(img, "captcha.png"),
+                               caption="Rasmdagi belgilarni yozib yuboring 👇", reply_markup=REFRESH_KB)
+        restart_status(uid)
         return
 
+    if captcha:
+        await status(msg, uid, "✅ Captcha o'tdi.", replace_last=True)
+    await logged_in(msg, state, uid)
+
+
+async def logged_in(msg: Message, state: FSMContext, uid: int) -> None:
+    sess = SESSIONS[uid]
+    name = await sess["client"].profile_name()
+    sess["profile"] = name
+    await status(msg, uid, "✅ Profilga kirdim" + (f": <b>{html.escape(name)}</b>" if name else "."))
     await show_reports(msg, state, uid)
 
 
@@ -265,7 +306,9 @@ async def ask_2fa(msg: Message, state: FSMContext, uid: int, tf: TwoFactorRequir
     else:
         await msg.answer(text + ("" if tf.link else "\n\n(Havola topilmadi — eMaktab ilovasi orqali tasdiqlang.)"),
                          reply_markup=markup)
+    restart_status(uid)
     sess = SESSIONS[uid]
+    await status(msg, uid, "🛡 Sayt kirishni Telegram orqali tasdiqlashni so'radi. Tasdiqlashingiz kutilmoqda...")
     sess["busy"] = True
     try:
         ok = await sess["client"].wait_2fa(300)
@@ -279,8 +322,8 @@ async def ask_2fa(msg: Message, state: FSMContext, uid: int, tf: TwoFactorRequir
         return
     if not ok:
         return await fail(msg, state, uid, "Kirish 5 daqiqa ichida tasdiqlanmadi.")
-    await msg.answer("✅ Kirish tasdiqlandi.")
-    await show_reports(msg, state, uid)
+    await status(msg, uid, "✅ Kirish tasdiqlandi.", replace_last=True)
+    await logged_in(msg, state, uid)
 
 
 def reports_kb() -> InlineKeyboardMarkup:
@@ -290,7 +333,8 @@ def reports_kb() -> InlineKeyboardMarkup:
 
 async def show_reports(msg: Message, state: FSMContext, uid: int, edit: bool = False) -> None:
     await state.set_state(Form.choose)
-    text = "✅ Siz tizimdasiz.\n\n3️⃣ <b>Hisobot turini</b> tanlang:"
+    prof = SESSIONS.get(uid, {}).get("profile")
+    text = ("👤 Profil: <b>" + html.escape(prof) + "</b>\n\n" if prof else "") + "3️⃣ <b>Hisobot turini</b> tanlang:"
     if edit:
         await msg.edit_text(text, reply_markup=reports_kb())
     else:
@@ -349,14 +393,8 @@ async def got_captcha(msg: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return await msg.answer("Seans tugagan. /start")
     touch(uid, bot, msg.chat.id, state)
-    wait = await msg.answer("⏳ Tekshirilmoqda...")
-    try:
-        await try_login(msg, state, uid, msg.text)
-    finally:
-        try:
-            await wait.delete()
-        except Exception:
-            pass
+    await status(msg, uid, f"⏳ Captcha (<code>{html.escape(msg.text.strip()[:20])}</code>) kiritildi, tekshirilmoqda...")
+    await try_login(msg, state, uid, msg.text)
 
 
 @router.callback_query(F.data == "cap_refresh")
