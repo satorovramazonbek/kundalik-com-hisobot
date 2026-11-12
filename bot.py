@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -23,15 +24,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from excel import build_class_excel, build_subject_excel, build_table_excel  # noqa: E402
-from scraper import REPORTS, KundalikClient, KundalikError, available_quarters  # noqa: E402
+from scraper import REPORTS, SUBJECT_REPORTS, KundalikClient, KundalikError, available_quarters  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
 TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
-SEM = asyncio.Semaphore(int(os.getenv("MAX_PARALLEL", "2")))
-SESSION_TTL = int(os.getenv("SESSION_TTL", "600"))  # ochiq seans necha soniya kutadi
+SEM = asyncio.Semaphore(int(os.getenv("MAX_PARALLEL", "3")))
+SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))  # ochiq brauzer necha soniya harakatsiz kutadi
+COOKIE_TTL = int(os.getenv("COOKIE_TTL", str(8 * 3600)))  # qayta login so'ramaslik muddati (faqat xotirada)
 
 router = Router()
 
@@ -45,10 +47,14 @@ class Form(StatesGroup):
 
 # user_id -> {"client", "classes", "periods", "class", "timer", "tries", "busy"}
 SESSIONS: dict[int, dict] = {}
+# user_id -> (cookie holati, tugash vaqti). Faqat operativ xotirada, diskka yozilmaydi.
+COOKIES: dict[int, tuple[dict, float]] = {}
 
 
 # ---------------- seans boshqaruvi ----------------
-async def drop_session(uid: int) -> None:
+async def drop_session(uid: int, logout: bool = False) -> None:
+    if logout:
+        COOKIES.pop(uid, None)
     sess = SESSIONS.pop(uid, None)
     if not sess:
         return
@@ -56,6 +62,10 @@ async def drop_session(uid: int) -> None:
     if t and t is not asyncio.current_task():
         t.cancel()
     try:
+        if not logout and sess["client"].logged_in:
+            st = await sess["client"].storage_state()
+            if st:
+                COOKIES[uid] = (st, time.time() + COOKIE_TTL)
         await sess["client"].close()
     finally:
         SEM.release()
@@ -74,7 +84,8 @@ def touch(uid: int, bot: Bot, chat_id: int, state: FSMContext) -> None:
         if uid in SESSIONS:
             await drop_session(uid)
             await state.clear()
-            await bot.send_message(chat_id, "⌛ Seans vaqti tugadi. Qayta boshlash: /start")
+            await bot.send_message(chat_id, "💤 Uzoq vaqt harakat bo'lmadi, brauzer yopildi.\n"
+                                            "Davom etish uchun /start bosing (qayta login shart emas).")
 
     sess["timer"] = asyncio.create_task(expire())
 
@@ -95,9 +106,33 @@ REFRESH_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="�
 
 
 async def fail(msg: Message, state: FSMContext, uid: int, text: str) -> None:
+    """Login xatosi: seans yopiladi."""
     await state.clear()
-    await drop_session(uid)
+    await drop_session(uid, logout=True)
     await msg.answer(f"⚠️ {text}\n\nQayta urinish: /start")
+
+
+async def soft_fail(msg: Message, state: FSMContext, uid: int, text: str) -> None:
+    """Hisobot xatosi: seans saqlanadi, menyuga qaytamiz."""
+    await msg.answer(f"⚠️ {text}")
+    if uid in SESSIONS:
+        await show_reports(msg, state, uid)
+    else:
+        await msg.answer("Qayta urinish: /start")
+
+
+async def open_session(uid: int, client: KundalikClient, bot: Bot, chat_id: int, state: FSMContext,
+                       storage_state: dict | None = None) -> bool:
+    await SEM.acquire()
+    try:
+        await client.open(storage_state)
+    except Exception:
+        SEM.release()
+        log.exception("Brauzer ochilmadi")
+        return False
+    SESSIONS[uid] = {"client": client, "tries": 0, "busy": False}
+    touch(uid, bot, chat_id, state)
+    return True
 
 
 # ---------------- handlerlar ----------------
@@ -108,9 +143,32 @@ async def not_allowed(msg: Message):
 
 @router.message(CommandStart())
 @router.message(Command("hisobot"))
-async def start(msg: Message, state: FSMContext):
+async def start(msg: Message, state: FSMContext, bot: Bot):
+    uid = msg.from_user.id
     await state.clear()
-    await drop_session(msg.from_user.id)
+    sess = SESSIONS.get(uid)
+    if sess and sess["client"].logged_in and not sess["busy"]:
+        touch(uid, bot, msg.chat.id, state)
+        return await show_reports(msg, state, uid)
+    await drop_session(uid)
+
+    saved = COOKIES.get(uid)
+    if saved and saved[1] > time.time():
+        wait = await msg.answer("⏳ Avvalgi seans tiklanmoqda...")
+        client = KundalikClient("", "")
+        ok = await open_session(uid, client, bot, msg.chat.id, state, saved[0])
+        if ok and await client.resume():
+            try:
+                await wait.delete()
+            except Exception:
+                pass
+            return await show_reports(msg, state, uid)
+        await drop_session(uid, logout=True)
+        try:
+            await wait.edit_text("Seans muddati tugagan, qayta kirish kerak.")
+        except Exception:
+            pass
+
     await msg.answer(
         "👋 Assalomu alaykum!\n"
         "Men kundalik.com (emaktab.uz) dan sinfning <b>choraklik hisobotini</b> Excel qilib beraman.\n\n"
@@ -124,7 +182,15 @@ async def start(msg: Message, state: FSMContext):
 async def cancel(msg: Message, state: FSMContext):
     await state.clear()
     await drop_session(msg.from_user.id)
-    await msg.answer("❌ Bekor qilindi. Qayta boshlash: /start", reply_markup=ReplyKeyboardRemove())
+    await msg.answer("❌ Bekor qilindi. Davom etish: /start", reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("chiqish"))
+async def logout(msg: Message, state: FSMContext):
+    await state.clear()
+    await drop_session(msg.from_user.id, logout=True)
+    await msg.answer("🚪 Tizimdan chiqildi, saqlangan seans o'chirildi. Qayta kirish: /start",
+                     reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Form.login, F.text)
@@ -144,21 +210,14 @@ async def got_password(msg: Message, state: FSMContext, bot: Bot):
         pass
     data = await state.get_data()
     await state.set_data({})  # parol FSM xotirasida qolmasin
-    await drop_session(uid)
+    await drop_session(uid, logout=True)
 
     wait = await msg.answer("⏳ Kundalik.com ga ulanilmoqda...")
-    await SEM.acquire()
     client = KundalikClient(data["login"], password)
-    try:
-        await client.open()
-    except Exception:
-        SEM.release()
-        log.exception("Brauzer ochilmadi")
+    if not await open_session(uid, client, bot, msg.chat.id, state):
         await state.clear()
         await msg.answer("❗ Brauzer ishga tushmadi. /start")
         return
-    SESSIONS[uid] = {"client": client, "tries": 0, "busy": False}
-    touch(uid, bot, msg.chat.id, state)
     try:
         await wait.delete()
     except Exception:
@@ -196,7 +255,7 @@ def reports_kb() -> InlineKeyboardMarkup:
 
 async def show_reports(msg: Message, state: FSMContext, uid: int, edit: bool = False) -> None:
     await state.set_state(Form.choose)
-    text = "✅ Tizimga kirildi.\n\n3️⃣ <b>Hisobot turini</b> tanlang:"
+    text = "✅ Siz tizimdasiz.\n\n3️⃣ <b>Hisobot turini</b> tanlang:"
     if edit:
         await msg.edit_text(text, reply_markup=reports_kb())
     else:
@@ -238,9 +297,10 @@ async def again(cb: CallbackQuery, state: FSMContext, bot: Bot):
 async def done(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
-    await drop_session(cb.from_user.id)
+    await drop_session(cb.from_user.id)  # cookie saqlanadi — /start da qayta login so'ralmaydi
     await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.message.answer("✅ Tayyor. Yangi hisobot: /start")
+    await cb.message.answer("✅ Tayyor. Yana hisobot kerak bo'lsa /start bosing (qayta login shart emas).\n"
+                            "Tizimdan butunlay chiqish: /chiqish")
 
 
 NEXT_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔁 Boshqa hisobot", callback_data="again"),
@@ -289,10 +349,12 @@ async def show_classes(msg: Message, state: FSMContext, uid: int) -> None:
     try:
         classes = await sess["client"].list_classes(report)
     except KundalikError as e:
-        return await fail(msg, state, uid, str(e))
+        sess["busy"] = False
+        return await soft_fail(msg, state, uid, str(e))
     except Exception:
         log.exception("Sinflar olinmadi")
-        return await fail(msg, state, uid, "Sinflar ro'yxatini olishda xatolik.")
+        sess["busy"] = False
+        return await soft_fail(msg, state, uid, "Sinflar ro'yxatini olishda xatolik.")
     finally:
         sess["busy"] = False
         try:
@@ -323,7 +385,8 @@ async def chose_class(cb: CallbackQuery, state: FSMContext, bot: Bot):
 def subjects_kb(subjects: list[str]) -> InlineKeyboardMarkup:
     m = kb(subjects, "sub", cols=2)
     m.inline_keyboard.append([InlineKeyboardButton(text="📊 Umumiy (barcha fanlar)", callback_data="sub:all")])
-    m.inline_keyboard.append([InlineKeyboardButton(text="✅ Tugatish", callback_data="sub:done")])
+    m.inline_keyboard.append([InlineKeyboardButton(text="🔁 Boshqa hisobot", callback_data="again"),
+                              InlineKeyboardButton(text="✅ Tugatish", callback_data="done")])
     return m
 
 
@@ -344,16 +407,20 @@ async def chose_quarter(cb: CallbackQuery, state: FSMContext, bot: Bot):
     report, rname = REPORTS[key]
     sess["busy"] = True
     try:
-        if key != "cr":
+        if key not in SUBJECT_REPORTS:
+            sess["busy"] = False
             return await send_table_report(cb, state, uid, report, rname, cname, gid, quarter)
-        rep = await asyncio.wait_for(sess["client"].build_class_report(cname, gid, quarter), 300)
+        rep = await asyncio.wait_for(sess["client"].build_class_report(cname, gid, quarter, report), 300)
     except KundalikError as e:
-        return await fail(cb.message, state, uid, str(e))
+        sess["busy"] = False
+        return await soft_fail(cb.message, state, uid, str(e))
     except asyncio.TimeoutError:
-        return await fail(cb.message, state, uid, "Sayt juda sekin javob berdi. Keyinroq urinib ko'ring.")
+        sess["busy"] = False
+        return await soft_fail(cb.message, state, uid, "Sayt juda sekin javob berdi. Keyinroq urinib ko'ring.")
     except Exception:
         log.exception("Hisobot xato")
-        return await fail(cb.message, state, uid, "Kutilmagan xatolik yuz berdi.")
+        sess["busy"] = False
+        return await soft_fail(cb.message, state, uid, "Kutilmagan xatolik yuz berdi.")
     finally:
         sess["busy"] = False
 
@@ -362,7 +429,7 @@ async def chose_quarter(cb: CallbackQuery, state: FSMContext, bot: Bot):
     if not re.search(rf"\b{quarter}\b", rep.period):
         note = f"\n⚠️ Sayt <b>{rep.period}</b> uchun hisobot berdi (chorak sanalarini .env da tekshiring)."
     await cb.message.edit_text(
-        f"Sinf: <b>{cname}</b>, hisobot davri: <b>{rep.period}</b>{note}\n\n"
+        f"{rname}\nSinf: <b>{cname}</b>, hisobot davri: <b>{rep.period}</b>{note}\n\n"
         f"6️⃣ <b>Fanni</b> tanlang (bir nechtasini ketma-ket olishingiz mumkin):",
         reply_markup=subjects_kb(rep.subjects),
     )
@@ -372,15 +439,18 @@ async def send_table_report(cb: CallbackQuery, state: FSMContext, uid: int, repo
                             cname: str, gid: str, quarter: int) -> None:
     """O'zlashtirish/Davomat -> Sinflar: jadvalni Excel qilib yuboradi."""
     sess = SESSIONS[uid]
+    sess["busy"] = True
     try:
         rep = await asyncio.wait_for(sess["client"].build_table_report(report, rname, cname, gid, quarter), 300)
     except KundalikError as e:
-        return await fail(cb.message, state, uid, str(e))
+        return await soft_fail(cb.message, state, uid, str(e))
     except asyncio.TimeoutError:
-        return await fail(cb.message, state, uid, "Sayt juda sekin javob berdi. Keyinroq urinib ko'ring.")
+        return await soft_fail(cb.message, state, uid, "Sayt juda sekin javob berdi. Keyinroq urinib ko'ring.")
     except Exception:
         log.exception("Hisobot xato")
-        return await fail(cb.message, state, uid, "Kutilmagan xatolik yuz berdi.")
+        return await soft_fail(cb.message, state, uid, "Kutilmagan xatolik yuz berdi.")
+    finally:
+        sess["busy"] = False
     note = ""
     if not re.search(rf"\b{quarter}\b", rep.period):
         note = f"\n⚠️ Sayt <b>{rep.period}</b> uchun hisobot berdi."
@@ -401,13 +471,6 @@ async def chose_subject(cb: CallbackQuery, state: FSMContext, bot: Bot):
     if not sess or "report" not in sess:
         return await cb.answer("Seans tugagan. /start", show_alert=True)
     what = cb.data.split(":")[1]
-    if what == "done":
-        await cb.answer()
-        await state.clear()
-        await drop_session(uid)
-        await cb.message.edit_reply_markup(reply_markup=None)
-        return await cb.message.answer("✅ Tayyor. Yangi hisobot: /start")
-
     touch(uid, bot, cb.message.chat.id, state)
     rep = sess["report"]
     try:
@@ -420,7 +483,7 @@ async def chose_subject(cb: CallbackQuery, state: FSMContext, bot: Bot):
             caption = f"📘 {rep.class_name} — {rep.subjects[idx]}, {rep.period}"
         await cb.answer("Yuborilmoqda...")
         await cb.message.answer_document(BufferedInputFile(content, filename=filename),
-                                         caption=caption + "\n\nYana fan tanlang yoki «✅ Tugatish» ni bosing.")
+                                         caption=caption + "\n\nYana fan tanlang, «🔁 Boshqa hisobot» yoki «✅ Tugatish» ni bosing.")
     except Exception:
         log.exception("Excel xato")
         await cb.answer("Xatolik yuz berdi", show_alert=True)

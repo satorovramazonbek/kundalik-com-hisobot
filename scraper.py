@@ -33,10 +33,12 @@ RE_PERIOD = re.compile(r"chorak|чорак|четверт|yarim|полугод|s
 REPORT_KEY = os.getenv("REPORT_KEY", "progress-classteacher")
 # Botda tanlanadigan hisobotlar: kalit -> (sayt report=..., tugma nomi)
 REPORTS = {
-    "cr": ("progress-classteacher", "👩‍🏫 Fan bo‘yicha (Sinf rahbariga)"),
-    "pg": ("progress-groups", "📘 O‘zlashtirish — Sinflar"),
+    "cr": ("progress-classteacher", "👩‍🏫 Fan bo‘yicha — o‘rtacha baholar (Sinf rahbariga)"),
+    "pg": ("progress-groups", "📘 O‘zlashtirish — fanlar kesimida (chorak baholari)"),
     "ca": ("class-attendance", "🗓 Davomat — Sinflar"),
 }
+# Fanlar kesimida (fan tugmalari bilan) chiqadigan hisobotlar
+SUBJECT_REPORTS = {"cr", "pg"}
 STUDY_YEAR = os.getenv("STUDY_YEAR", time.strftime("%Y") if int(time.strftime("%m")) >= 9 else str(int(time.strftime("%Y")) - 1))
 
 
@@ -264,19 +266,25 @@ class KundalikClient:
             raise KundalikError("Hisobot sahifasida sinflar ro'yxati topilmadi.")
         return out
 
-    async def build_class_report(self, class_name: str, group_id: str, quarter: int) -> ClassReport:
+    async def build_class_report(self, class_name: str, group_id: str, quarter: int,
+                                 report: str = REPORT_KEY) -> ClassReport:
+        """O'quvchilar x fanlar jadvali (Sinf rahbariga / O'zlashtirish - Sinflar)."""
         page = self.page
-        await page.goto(await self._report_url(f"&group={group_id}"), wait_until="networkidle")
-        date = quarter_date(quarter)
-        await page.evaluate("d => { const el = document.querySelector('#date'); if (el) { el.value = d;"
-                            " el.dispatchEvent(new Event('change', {bubbles: true})); } }", date)
-        await self._dump(page, "report_params")
+        await page.goto(await self._report_url(f"&group={group_id}", report=report), wait_until="networkidle")
+        if report == "progress-classteacher":
+            date = quarter_date(quarter)
+            await page.evaluate("d => { const el = document.querySelector('#date'); if (el) { el.value = d;"
+                                " el.dispatchEvent(new Event('change', {bubbles: true})); } }", date)
+        else:
+            await self._set_period(page, quarter)
+        await self._dump(page, f"params_{report}")
 
         btn = page.locator("#build_report_button")
         await btn.wait_for(state="visible")
         await btn.click()
         try:
-            await page.wait_for_selector("#reportPlaceHolder table#marks", timeout=180000)
+            await page.wait_for_selector("#reportPlaceHolder table#resultsTable, #reportPlaceHolder table#marks",
+                                         timeout=180000)
         except PWTimeout:
             msg = await page.evaluate("() => (document.querySelector('#errors')?.innerText || '').trim()")
             raise KundalikError("Hisobot tuzilmadi." + (f"\nSayt javobi: {msg}" if msg else ""))
@@ -412,10 +420,12 @@ class KundalikClient:
             """() => {
                 const clean = el => el.innerText.replace(/\\s+/g, ' ').trim();
                 const ph = document.querySelector('#reportPlaceHolder');
-                const t = ph.querySelector('table#marks');
+                const t = ph.querySelector('table#resultsTable') || ph.querySelector('table#marks');
                 const head = [...t.querySelectorAll('thead tr:first-child > *')].map(clean);
-                const body = [...t.querySelectorAll('tbody tr')].map(tr => [...tr.children].map(clean));
-                const foot = [...t.querySelectorAll('tfoot tr')].map(tr => [...tr.children].map(clean));
+                const all = [...t.querySelectorAll(':scope > tbody > tr, :scope > tfoot > tr')]
+                    .map(tr => [...tr.children].map(clean));
+                const body = all.filter(r => /^\\d+$/.test(r[0] || ''));
+                const foot = all.filter(r => r[0] && !/^\\d+$/.test(r[0]));
                 const title = (ph.querySelector('div')?.innerText || '').trim();
                 return {head, body, foot, title};
             }"""
@@ -427,8 +437,8 @@ class KundalikClient:
         students = [(r[0], r[1], r[2:2 + n], r[2 + n] if len(r) > 2 + n else "", r[3 + n] if len(r) > 3 + n else "")
                     for r in data["body"] if len(r) >= 2 + n]
         footer = [(r[0], r[1:1 + n]) for r in data["foot"] if r]
-        m = re.search(r":\s*(.+)$", data["title"])
-        period = m.group(1).strip() if m else f"{quarter} chorak"
+        m = re.search(r"(\d)\s*-?\s*(chorak|чорак|четверт)", data["title"], re.I)
+        period = f"{m.group(1)} chorak" if m else f"{quarter} chorak"
         log.info("Hisobot: %s, %s, fanlar=%s, o'quvchilar=%d", class_name, period, subjects, len(students))
         if not subjects:
             raise KundalikError("Hisobotda fanlar topilmadi.")
@@ -460,13 +470,30 @@ class KundalikClient:
             }"""
         )
 
-    async def open(self) -> None:
+    async def open(self, storage_state: dict | None = None) -> None:
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(headless=HEADLESS)
-        self._ctx = await self._browser.new_context(locale="uz-UZ", accept_downloads=True,
+        self._ctx = await self._browser.new_context(locale="uz-UZ", accept_downloads=True, storage_state=storage_state,
                                                     viewport={"width": 1600, "height": 1000})
         self.page = await self._ctx.new_page()
         self.page.set_default_timeout(30000)
+
+    async def storage_state(self) -> dict | None:
+        try:
+            return await self._ctx.storage_state()
+        except Exception:
+            return None
+
+    async def resume(self) -> bool:
+        """Saqlangan cookie bilan kirilganmi — tekshiradi."""
+        try:
+            await self.page.goto("https://emaktab.uz/teachers", wait_until="domcontentloaded")
+        except Exception:
+            return False
+        if "login." in self.page.url:
+            return False
+        self.logged_in = True
+        return True
 
     async def close(self) -> None:
         for obj in (getattr(self, "_ctx", None), getattr(self, "_browser", None)):
