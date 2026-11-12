@@ -15,6 +15,9 @@ import time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.methods import GetUpdates
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -142,7 +145,10 @@ async def status(msg: Message, uid: int, line: str, replace_last: bool = False) 
             return
     except Exception:
         pass
-    sess["status_msg"] = await msg.answer(text)
+    try:
+        sess["status_msg"] = await msg.answer(text)
+    except Exception:
+        log.warning("Holat xabarini yuborib bo'lmadi: %s", line)
 
 
 def restart_status(uid: int) -> None:
@@ -348,11 +354,18 @@ async def ask_2fa(msg: Message, state: FSMContext, uid: int, tf: TwoFactorRequir
     if tf.link:
         buttons.append([InlineKeyboardButton(text="✅ Telegram'da tasdiqlash", url=tf.link)])
     markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    if tf.qr_png:
-        await msg.answer_photo(BufferedInputFile(tf.qr_png, "qr.png"), caption=text, reply_markup=markup)
-    else:
-        await msg.answer(text + ("" if tf.link else "\n\n(Havola topilmadi — eMaktab ilovasi orqali tasdiqlang.)"),
-                         reply_markup=markup)
+    try:
+        if tf.qr_png:
+            await msg.answer_photo(BufferedInputFile(tf.qr_png, "qr.png"), caption=text, reply_markup=markup)
+        else:
+            raise ValueError("QR yo'q")
+    except Exception:
+        # Rasm yuborilmasa — oddiy matn + tugma (kutish baribir davom etadi)
+        try:
+            await msg.answer(text + ("" if tf.link else "\n\n(Havola topilmadi — eMaktab ilovasi orqali tasdiqlang.)"),
+                             reply_markup=markup)
+        except Exception:
+            log.exception("2FA xabarini yuborib bo'lmadi")
     restart_status(uid)
     sess = SESSIONS[uid]
     await status(msg, uid, "🛡 Sayt kirishni Telegram orqali tasdiqlashni so'radi. Tasdiqlashingiz kutilmoqda...")
@@ -619,10 +632,27 @@ async def fallback(msg: Message):
     await msg.answer("Hisobot olish uchun /start bosing.")
 
 
+class RetryOnNetworkError(BaseRequestMiddleware):
+    """Telegram bilan aloqa uzilsa (Connection reset, timeout) so'rovni 4 martagacha qayta yuboradi."""
+
+    async def __call__(self, make_request, bot, method):
+        if isinstance(method, GetUpdates):  # polling o'zi qayta urinadi
+            return await make_request(bot, method)
+        for attempt in range(4):
+            try:
+                return await make_request(bot, method)
+            except TelegramNetworkError as e:
+                if attempt == 3:
+                    raise
+                log.warning("Telegram tarmoq xatosi (%s), %d-qayta urinish: %s", type(method).__name__, attempt + 1, e)
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+
 async def main():
     if not TOKEN:
         raise SystemExit("BOT_TOKEN topilmadi. .env fayliga BOT_TOKEN=... yozing.")
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    bot.session.middleware(RetryOnNetworkError())
     dp = Dispatcher()
     dp.include_router(router)
 
