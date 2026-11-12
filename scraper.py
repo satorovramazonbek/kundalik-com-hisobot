@@ -519,12 +519,25 @@ class KundalikClient:
             }"""
         )
 
-    async def open(self, storage_state: dict | None = None) -> None:
+    async def open(self, storage_state: dict | None = None, profile_dir: str | Path | None = None) -> None:
+        """profile_dir berilsa — doimiy brauzer profili (oddiy brauzerdek qurilmani eslab qoladi)."""
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=HEADLESS)
-        self._ctx = await self._browser.new_context(locale="uz-UZ", accept_downloads=True, storage_state=storage_state,
-                                                    viewport={"width": 1600, "height": 1000})
-        self.page = await self._ctx.new_page()
+        opts = dict(locale="uz-UZ", accept_downloads=True, viewport={"width": 1600, "height": 1000})
+        self._browser = None
+        if profile_dir:
+            try:
+                Path(profile_dir).mkdir(parents=True, exist_ok=True)
+                os.chmod(profile_dir, 0o700)
+                self._ctx = await self._pw.chromium.launch_persistent_context(str(profile_dir), headless=HEADLESS, **opts)
+                if storage_state and storage_state.get("cookies"):
+                    await self._ctx.add_cookies(storage_state["cookies"])
+            except Exception:
+                log.exception("Doimiy profil ochilmadi, oddiy brauzer bilan davom etiladi")
+                self._ctx = None
+        if not getattr(self, "_ctx", None):
+            self._browser = await self._pw.chromium.launch(headless=HEADLESS)
+            self._ctx = await self._browser.new_context(storage_state=storage_state, **opts)
+        self.page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         self.page.set_default_timeout(30000)
 
     async def profile_name(self) -> str:

@@ -62,8 +62,11 @@ async def drop_session(uid: int, logout: bool = False) -> None:
     if logout:
         COOKIES.pop(uid, None)
         audit.delete_session(uid)
+        audit.delete_credentials(uid)
     sess = SESSIONS.pop(uid, None)
     if not sess:
+        if logout:
+            audit.delete_profiles(uid)
         return
     t = sess.get("timer")
     if t and t is not asyncio.current_task():
@@ -72,6 +75,8 @@ async def drop_session(uid: int, logout: bool = False) -> None:
         if not logout:
             await persist(uid, sess)
         await sess["client"].close()
+        if logout:
+            audit.delete_profiles(uid)
     finally:
         SEM.release()
 
@@ -165,7 +170,11 @@ async def fail(msg: Message, state: FSMContext, uid: int, text: str) -> None:
     if sess and sess.get("user"):
         audit.log_event(sess["user"], "login_fail", sess.get("login", ""), details=text.split("\n")[0])
     await state.clear()
-    await drop_session(uid, logout=True)
+    if "noto'g'ri" in text and "Captcha" not in text:  # login/parol xato — saqlanganini o'chiramiz
+        audit.delete_credentials(uid)
+    COOKIES.pop(uid, None)
+    audit.delete_session(uid)
+    await drop_session(uid)  # brauzer profili qoladi (qurilma "tanish" bo'lib qoladi)
     await msg.answer(f"⚠️ {text}\n\nQayta urinish: /start")
 
 
@@ -182,7 +191,7 @@ async def open_session(uid: int, client: KundalikClient, bot: Bot, chat_id: int,
                        storage_state: dict | None = None, user=None, login: str = "") -> bool:
     await SEM.acquire()
     try:
-        await client.open(storage_state)
+        await client.open(storage_state, audit.profile_dir(uid, login or client.login_name))
     except Exception:
         SEM.release()
         log.exception("Brauzer ochilmadi")
@@ -226,11 +235,17 @@ async def start(msg: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
             return await show_reports(msg, state, uid)
-        await drop_session(uid, logout=True)
+        COOKIES.pop(uid, None)
+        audit.delete_session(uid)
+        await drop_session(uid)
         try:
-            await wait.edit_text("Seans muddati tugagan, qayta kirish kerak.")
+            await wait.edit_text("Seans muddati tugagan, qayta kiraman...")
         except Exception:
             pass
+
+    creds = audit.load_credentials(uid)
+    if creds:
+        return await do_login(msg, state, bot, uid, creds[0], creds[1], auto=True)
 
     await msg.answer(
         "👋 Assalomu alaykum!\n"
@@ -254,7 +269,7 @@ async def logout(msg: Message, state: FSMContext):
     audit.log_event(msg.from_user, "logout", sess.get("login", ""), sess.get("profile", ""))
     await state.clear()
     await drop_session(msg.from_user.id, logout=True)
-    await msg.answer("🚪 Tizimdan chiqildi, saqlangan seans o'chirildi. Qayta kirish: /start",
+    await msg.answer("🚪 Tizimdan chiqildi, saqlangan seans va login/parol o'chirildi. Qayta kirish: /start",
                      reply_markup=ReplyKeyboardRemove())
 
 
@@ -289,17 +304,22 @@ async def got_password(msg: Message, state: FSMContext, bot: Bot):
         pass
     data = await state.get_data()
     await state.set_data({})  # parol FSM xotirasida qolmasin
-    await drop_session(uid)
-    saved = COOKIES.get(uid)  # oldingi seans cookie lari — sayt qurilmani "tanish" deb biladi, 2FA kamroq so'raladi
+    await do_login(msg, state, bot, uid, data["login"], password)
 
-    client = KundalikClient(data["login"], password)
-    audit.log_event(msg.from_user, "login_try", data["login"])
+
+async def do_login(msg: Message, state: FSMContext, bot: Bot, uid: int, login: str, password: str,
+                   auto: bool = False) -> None:
+    await drop_session(uid)
+    saved = COOKIES.get(uid)
+    client = KundalikClient(login, password)
+    audit.log_event(msg.from_user, "login_try", login, details="saqlangan login/parol bilan" if auto else "")
     if not await open_session(uid, client, bot, msg.chat.id, state, saved["state"] if saved else None,
-                              user=msg.from_user, login=data["login"]):
+                              user=msg.from_user, login=login):
         await state.clear()
         await msg.answer("❗ Brauzer ishga tushmadi. /start")
         return
-    await status(msg, uid, f"🔐 <b>{html.escape(data['login'])}</b> login orqali kirishga urinilmoqda...")
+    how = "saqlangan login/parol bilan" if auto else "login orqali"
+    await status(msg, uid, f"🔐 <b>{html.escape(login)}</b> {how} kirishga urinilmoqda...")
     await try_login(msg, state, uid, None)
 
 
@@ -340,6 +360,8 @@ async def logged_in(msg: Message, state: FSMContext, uid: int) -> None:
     sess["profile"] = name
     if sess.get("user"):
         audit.log_event(sess["user"], "login_ok", sess.get("login", ""), name)
+    if sess["client"].password:
+        audit.save_credentials(uid, sess.get("login", ""), sess["client"].password)
     await persist(uid)
     await status(msg, uid, "✅ Profilga kirdim" + (f": <b>{html.escape(name)}</b>" if name else "."))
     await show_reports(msg, state, uid)

@@ -7,7 +7,9 @@ Kirishlar jurnali va diskdagi seanslar.
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import shutil
 import json
 import os
 import time
@@ -20,6 +22,7 @@ from openpyxl.utils import get_column_letter
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 JOURNAL = DATA_DIR / "jurnal.jsonl"
 SESS_DIR = DATA_DIR / "sessions"
+PROFILES_DIR = DATA_DIR / "profiles"
 
 EVENTS = {
     "login_try": "Kirishga urinish",
@@ -139,3 +142,59 @@ def load_sessions() -> dict[int, dict]:
 
 def delete_session(uid: int) -> None:
     (SESS_DIR / f"{uid}.json").unlink(missing_ok=True)
+
+
+# ---------------- doimiy brauzer profillari ----------------
+def profile_dir(uid: int, login: str) -> Path:
+    """Har Telegram foydalanuvchisi + eMaktab login uchun alohida profil (boshqa foydalanuvchi ishlata olmaydi)."""
+    _private_dir(PROFILES_DIR)
+    _private_dir(PROFILES_DIR / str(uid))
+    h = hashlib.sha256(login.strip().lower().encode()).hexdigest()[:16]
+    return PROFILES_DIR / str(uid) / h
+
+
+def delete_profiles(uid: int) -> None:
+    shutil.rmtree(PROFILES_DIR / str(uid), ignore_errors=True)
+
+
+# ---------------- saqlangan login/parol (shifrlangan) ----------------
+# Kalit .env dagi CRED_KEY da (data/ dan alohida). Fayl: data/credentials/<uid>.bin, huquq 600.
+CRED_DIR = DATA_DIR / "credentials"
+
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = os.getenv("CRED_KEY", "").strip()
+    if not key:
+        key = Fernet.generate_key().decode()
+        env = Path(".env")
+        with env.open("a", encoding="utf-8") as f:
+            f.write(f"\nCRED_KEY={key}\n")
+        os.environ["CRED_KEY"] = key
+    return Fernet(key.encode())
+
+
+def save_credentials(uid: int, login: str, password: str) -> None:
+    _private_dir(CRED_DIR)
+    token = _fernet().encrypt(json.dumps({"login": login, "password": password}).encode())
+    path = CRED_DIR / f"{uid}.bin"
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(token)
+    os.replace(tmp, path)
+
+
+def load_credentials(uid: int) -> tuple[str, str] | None:
+    path = CRED_DIR / f"{uid}.bin"
+    if not path.exists():
+        return None
+    try:
+        d = json.loads(_fernet().decrypt(path.read_bytes()))
+        return d["login"], d["password"]
+    except Exception:
+        return None
+
+
+def delete_credentials(uid: int) -> None:
+    (CRED_DIR / f"{uid}.bin").unlink(missing_ok=True)
