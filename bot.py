@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from excel import build_class_excel, build_subject_excel, build_table_excel  # noqa: E402
-from scraper import REPORTS, SUBJECT_REPORTS, KundalikClient, KundalikError, available_quarters  # noqa: E402
+from scraper import REPORTS, SUBJECT_REPORTS, KundalikClient, KundalikError, TwoFactorRequired, available_quarters  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -210,11 +210,12 @@ async def got_password(msg: Message, state: FSMContext, bot: Bot):
         pass
     data = await state.get_data()
     await state.set_data({})  # parol FSM xotirasida qolmasin
-    await drop_session(uid, logout=True)
+    await drop_session(uid)
+    saved = COOKIES.get(uid)  # oldingi seans cookie lari — sayt qurilmani "tanish" deb biladi, 2FA kamroq so'raladi
 
     wait = await msg.answer("⏳ Kundalik.com ga ulanilmoqda...")
     client = KundalikClient(data["login"], password)
-    if not await open_session(uid, client, bot, msg.chat.id, state):
+    if not await open_session(uid, client, bot, msg.chat.id, state, saved[0] if saved else None):
         await state.clear()
         await msg.answer("❗ Brauzer ishga tushmadi. /start")
         return
@@ -229,6 +230,8 @@ async def try_login(msg: Message, state: FSMContext, uid: int, captcha: str | No
     sess = SESSIONS[uid]
     try:
         img = await sess["client"].login(captcha)
+    except TwoFactorRequired as tf:
+        return await ask_2fa(msg, state, uid, tf)
     except KundalikError as e:
         return await fail(msg, state, uid, str(e))
     except Exception:
@@ -245,6 +248,38 @@ async def try_login(msg: Message, state: FSMContext, uid: int, captcha: str | No
         await msg.answer_photo(BufferedInputFile(img, "captcha.png"), caption=caption, reply_markup=REFRESH_KB)
         return
 
+    await show_reports(msg, state, uid)
+
+
+async def ask_2fa(msg: Message, state: FSMContext, uid: int, tf: TwoFactorRequired) -> None:
+    """Sayt yangi qurilmadan kirishni Telegram orqali tasdiqlashni so'raydi — o'qituvchi o'zi tasdiqlaydi."""
+    text = ("🛡 <b>eMaktab kirishni tasdiqlashni so'rayapti</b> (yangi qurilma).\n\n"
+            "Pastdagi tugmani bosing, ochilgan rasmiy <b>@emaktab_auth_bot</b> da kirishni tasdiqlang. "
+            "Tasdiqlashingiz bilan bot o'zi davom etadi (5 daqiqa kutadi).")
+    buttons = []
+    if tf.link:
+        buttons.append([InlineKeyboardButton(text="✅ Telegram'da tasdiqlash", url=tf.link)])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    if tf.qr_png:
+        await msg.answer_photo(BufferedInputFile(tf.qr_png, "qr.png"), caption=text, reply_markup=markup)
+    else:
+        await msg.answer(text + ("" if tf.link else "\n\n(Havola topilmadi — eMaktab ilovasi orqali tasdiqlang.)"),
+                         reply_markup=markup)
+    sess = SESSIONS[uid]
+    sess["busy"] = True
+    try:
+        ok = await sess["client"].wait_2fa(300)
+    except Exception:
+        log.exception("2FA kutishda xato")
+        ok = False
+    finally:
+        if uid in SESSIONS:
+            sess["busy"] = False
+    if uid not in SESSIONS:
+        return
+    if not ok:
+        return await fail(msg, state, uid, "Kirish 5 daqiqa ichida tasdiqlanmadi.")
+    await msg.answer("✅ Kirish tasdiqlandi.")
     await show_reports(msg, state, uid)
 
 

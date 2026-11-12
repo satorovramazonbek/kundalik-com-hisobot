@@ -46,6 +46,15 @@ class KundalikError(Exception):
     """Foydalanuvchiga ko'rsatiladigan xatolik."""
 
 
+class TwoFactorRequired(Exception):
+    """Sayt yangi qurilmadan kirishni Telegram orqali tasdiqlashni so'rayapti."""
+
+    def __init__(self, link: str | None, qr_png: bytes | None):
+        super().__init__("2FA")
+        self.link = link
+        self.qr_png = qr_png
+
+
 @dataclass
 class Report:
     title: str
@@ -205,6 +214,9 @@ class KundalikClient:
         if captcha is None:
             await page.goto(LOGIN_URL, wait_until="domcontentloaded")
             await self._dump(page, "login_page")
+            if "login." not in page.url:  # saqlangan seans bilan allaqachon kirilgan
+                self.logged_in = True
+                return None
             if await self._captcha_visible(page):
                 await page.fill("input[name='login']", self.login_name)
                 await page.fill("input[name='password']", self.password)
@@ -221,14 +233,51 @@ class KundalikClient:
             pass
         await self._dump(page, "after_login")
 
+        if "2fa" in page.url.lower():
+            await self._raise_2fa(page)
+
         if "login." in page.url and await page.locator("input[name='password']").count():
             if await self._captcha_visible(page):
                 return await self._captcha_png(page)
             err = page.locator(".login__body__hint_error-message:not(.login__body__hint_hidden)")
             msg = (await err.first.inner_text()).strip() if await err.count() else ""
             raise KundalikError("Login yoki parol noto'g'ri." + (f"\nSayt javobi: {msg}" if msg else ""))
+        if "login." in page.url:
+            raise KundalikError("Tizimga kirish yakunlanmadi (sayt kutilmagan sahifa ochdi).")
         self.logged_in = True
         return None
+
+    async def _raise_2fa(self, page: Page) -> None:
+        link = await page.evaluate(
+            "() => { const a = [...document.querySelectorAll('a[href]')].find(a => /t\\.me\\/.+_bot\\?start=/i.test(a.href));"
+            " return a ? a.href : null; }")
+        if not link:
+            m = re.search(r"https://t\.me/[A-Za-z0-9_]+_bot\?start=[A-Za-z0-9_-]+", await page.content())
+            link = m.group(0) if m else None
+        qr = None
+        for sel in ("canvas", "svg[class*='qr' i]", "img[src*='qr' i]", "[class*='qr' i]"):
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible():
+                    qr = await loc.screenshot()
+                    break
+            except Exception:
+                pass
+        raise TwoFactorRequired(link, qr)
+
+    async def wait_2fa(self, timeout_s: int = 300) -> bool:
+        """Foydalanuvchi Telegram'da tasdiqlaguncha kutadi."""
+        try:
+            await self.page.wait_for_url(lambda u: "login." not in u, timeout=timeout_s * 1000)
+        except PWTimeout:
+            return False
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=30000)
+        except PWTimeout:
+            pass
+        await self._dump(self.page, "after_2fa")
+        self.logged_in = True
+        return True
 
     # ---------------- hisobot ----------------
     async def _report_url(self, extra: str = "", report: str = REPORT_KEY) -> str:
